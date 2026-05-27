@@ -57,3 +57,30 @@ func TestSystemDependencyInstallCommandDeduplicatesPackages(t *testing.T) {
 		t.Fatalf("InstallCommand() = %q, want %q", got, want)
 	}
 }
+
+func TestMeterTargetForNodePrefersMonitorFL(t *testing.T) {
+	node := AudioNode{
+		Name: "alsa_output.usb-Focusrite.Analog-Stereo",
+		Ports: []string{
+			"alsa_output.usb-Focusrite.Analog-Stereo:monitor_FR",
+			"alsa_output.usb-Focusrite.Analog-Stereo:playback_FL",
+			"alsa_output.usb-Focusrite.Analog-Stereo:monitor_FL",
+		},
+	}
+
+	want := "alsa_output.usb-Focusrite.Analog-Stereo:monitor_FL"
+	if got := meterTargetForNode(node); got != want {
+		t.Fatalf("meterTargetForNode() = %q, want %q", got, want)
+	}
+}
+
+func TestMeterTargetForNodeFallsBackToNodeName(t *testing.T) {
+	node := AudioNode{
+		Name:  "alsa_input.usb-Focusrite.capture",
+		Ports: []string{"alsa_input.usb-Focusrite.capture:capture_FL"},
+	}
+
+	if got := meterTargetForNode(node); got != node.Name {
+		t.Fatalf("meterTargetForNode() = %q, want %q", got, node.Name)
+	}
+}

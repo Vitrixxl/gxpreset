@@ -223,6 +223,7 @@ type AudioState struct {
 	Spectrum      []float64
 	SpectrumShown []float64
 	MeterSource   string
+	MeterTarget   string
 	MeterErr      string
 }
 
@@ -291,6 +292,7 @@ type model struct {
 type MeterStream struct {
 	id     int
 	source string
+	target string
 	events chan meterMsg
 	cancel context.CancelFunc
 }
@@ -851,26 +853,30 @@ func (m model) ensureMeterStream() (model, tea.Cmd) {
 	if m.activeTab != tabAudio {
 		return m.stopMeterStream(), nil
 	}
-	source := m.audio.selectedMeterSourceName()
+	sourceNode := m.audio.selectedMeterSource()
+	source := sourceNode.Name
 	if source == "" || isMidiName(source) {
 		m = m.stopMeterStream()
 		m.audio.MeterSource = ""
+		m.audio.MeterTarget = ""
 		return m, nil
 	}
+	target := meterTargetForNode(sourceNode)
 	if source != m.config.LastMeterSource {
 		m.config.LastMeterSource = source
 		if err := saveAppConfig(m.config); err != nil {
 			m.addLog("config save failed: " + err.Error())
 		}
 	}
-	if m.meter != nil && m.meter.source == source {
+	if m.meter != nil && m.meter.source == source && m.meter.target == target {
 		return m, nil
 	}
 	m = m.stopMeterStream()
 	m.meterSeq++
-	stream := startMeterStream(m.meterSeq, source)
+	stream := startMeterStream(m.meterSeq, source, target)
 	m.meter = stream
 	m.audio.MeterSource = source
+	m.audio.MeterTarget = target
 	m.audio.MeterErr = ""
 	return m, listenMeterStream(stream)
 }
@@ -1266,11 +1272,18 @@ func (m model) audioSpectrumView(width int, height int) string {
 		source = m.audio.selectedMeterSourceName()
 	}
 	header := labelValue("Meter", source, width)
+	target := ""
+	if m.audio.MeterTarget != "" && m.audio.MeterTarget != source {
+		target = mutedStyle.Render("capture: " + truncate(m.audio.MeterTarget, width))
+	}
 	status := ""
 	if m.audio.MeterErr != "" {
 		status = mutedStyle.Render("meter: " + truncate(m.audio.MeterErr, width))
 	}
 	barHeight := height - lipgloss.Height(header)
+	if target != "" {
+		barHeight -= lipgloss.Height(target)
+	}
 	if status != "" {
 		barHeight -= lipgloss.Height(status)
 	}
@@ -1279,6 +1292,7 @@ func (m model) audioSpectrumView(width int, height int) string {
 	}
 	parts := []string{
 		header,
+		target,
 		spectrumProgressView(m.audio.SpectrumShown, width, barHeight),
 		status,
 	}
@@ -1682,11 +1696,15 @@ func audioDisconnectCmd(out AudioNode, in AudioNode) tea.Cmd {
 	}
 }
 
-func startMeterStream(id int, source string) *MeterStream {
+func startMeterStream(id int, source string, target string) *MeterStream {
+	if target == "" {
+		target = source
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	stream := &MeterStream{
 		id:     id,
 		source: source,
+		target: target,
 		events: make(chan meterMsg, 4),
 		cancel: cancel,
 	}
@@ -1722,7 +1740,7 @@ func runMeterStream(ctx context.Context, stream *MeterStream) {
 	cmd := exec.CommandContext(ctx, path,
 		"--record",
 		"--raw",
-		"--target", stream.source,
+		"--target", stream.target,
 		"--rate", strconv.Itoa(meterSampleRate),
 		"--channels", "1",
 		"--format", "s16",
@@ -2306,6 +2324,32 @@ func nodeName(port string) string {
 		return port[:i]
 	}
 	return port
+}
+
+func meterTargetForNode(node AudioNode) string {
+	preferred := ""
+	for _, port := range node.Ports {
+		if !isMonitorPort(port) {
+			continue
+		}
+		if preferred == "" {
+			preferred = port
+		}
+		if channelKey(port) == "FL" || strings.HasSuffix(strings.ToLower(port), "monitor_fl") {
+			return port
+		}
+	}
+	if preferred != "" {
+		return preferred
+	}
+	return node.Name
+}
+
+func isMonitorPort(port string) bool {
+	if i := strings.LastIndex(port, ":"); i >= 0 {
+		port = port[i+1:]
+	}
+	return strings.Contains(strings.ToLower(port), "monitor")
 }
 
 func pairPorts(outputs, inputs []string) [][2]string {
