@@ -297,6 +297,11 @@ type MeterStream struct {
 	cancel context.CancelFunc
 }
 
+type meterCommandSpec struct {
+	name string
+	args []string
+}
+
 type Downloader struct {
 	client *http.Client
 	dest   string
@@ -1737,25 +1742,58 @@ func runMeterStream(ctx context.Context, stream *MeterStream) {
 		return
 	}
 
-	cmd := exec.CommandContext(ctx, path,
-		"--record",
-		"--raw",
-		"--target", stream.target,
-		"--rate", strconv.Itoa(meterSampleRate),
-		"--channels", "1",
-		"--format", "s16",
-		"-",
-	)
-	cmd.Stderr = io.Discard
+	var lastErr error
+	for _, spec := range meterCommandSpecs(stream.target) {
+		frames, err := runMeterCommand(ctx, stream, path, spec)
+		if ctx.Err() != nil || err == nil {
+			return
+		}
+		lastErr = err
+		if frames > 0 {
+			break
+		}
+	}
+	if lastErr != nil {
+		publishMeterMsg(ctx, stream.events, meterMsg{streamID: stream.id, source: stream.source, err: lastErr})
+	}
+}
+
+func meterCommandSpecs(target string) []meterCommandSpec {
+	return []meterCommandSpec{
+		{
+			name: "raw",
+			args: []string{
+				"--record",
+				"--raw",
+				"--target", target,
+				"--rate", strconv.Itoa(meterSampleRate),
+				"--channels", "1",
+				"--format", "s16",
+				"-",
+			},
+		},
+		{
+			name: "compat",
+			args: []string{
+				"-r",
+				"--target", target,
+				"-",
+			},
+		},
+	}
+}
+
+func runMeterCommand(ctx context.Context, stream *MeterStream, path string, spec meterCommandSpec) (int, error) {
+	cmd := exec.CommandContext(ctx, path, spec.args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		publishMeterMsg(ctx, stream.events, meterMsg{streamID: stream.id, source: stream.source, err: err})
-		return
+		return 0, err
 	}
 	if err := cmd.Start(); err != nil {
-		publishMeterMsg(ctx, stream.events, meterMsg{streamID: stream.id, source: stream.source, err: err})
-		return
+		return 0, err
 	}
 	defer func() {
 		if cmd.Process != nil {
@@ -1765,28 +1803,47 @@ func runMeterStream(ctx context.Context, stream *MeterStream) {
 	}()
 
 	buf := make([]byte, meterFrameSamples*2)
+	frames := 0
+	firstChunk := true
 	for {
 		n, err := io.ReadFull(stdout, buf)
 		if n > 0 {
-			spectrum, calcErr := spectrumFromPCM(buf[:n], meterSpectrumBands, meterSampleRate)
+			data := buf[:n]
+			if firstChunk {
+				data = stripWAVHeader(data)
+				firstChunk = false
+			}
+			if len(data) < 2 {
+				continue
+			}
+			spectrum, calcErr := spectrumFromPCM(data, meterSpectrumBands, meterSampleRate)
 			if calcErr != nil {
 				if !publishMeterMsg(ctx, stream.events, meterMsg{streamID: stream.id, source: stream.source, err: calcErr}) {
-					return
+					return frames, nil
 				}
 			} else if !publishMeterMsg(ctx, stream.events, meterMsg{streamID: stream.id, source: stream.source, spectrum: spectrum}) {
-				return
+				return frames, nil
 			}
+			frames++
 		}
 		if err != nil {
 			if ctx.Err() != nil {
-				return
+				return frames, nil
 			}
 			if !errors.Is(err, io.ErrUnexpectedEOF) || n == 0 {
-				publishMeterMsg(ctx, stream.events, meterMsg{streamID: stream.id, source: stream.source, err: err})
-				return
+				return frames, meterCommandError(spec, err, stderr.String())
 			}
 		}
 	}
+}
+
+func meterCommandError(spec meterCommandSpec, err error, stderr string) error {
+	stderr = strings.TrimSpace(stderr)
+	command := "pw-cat " + strings.Join(spec.args, " ")
+	if stderr == "" {
+		return fmt.Errorf("%s: %w", command, err)
+	}
+	return fmt.Errorf("%s: %w: %s", command, err, truncate(stderr, 180))
 }
 
 func publishMeterMsg(ctx context.Context, events chan meterMsg, msg meterMsg) bool {
@@ -2410,6 +2467,28 @@ func channelKey(port string) string {
 		}
 	}
 	return ""
+}
+
+func stripWAVHeader(data []byte) []byte {
+	if len(data) < 12 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
+		return data
+	}
+	for offset := 12; offset+8 <= len(data); {
+		chunkID := string(data[offset : offset+4])
+		chunkSize := int(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
+		offset += 8
+		if chunkID == "data" {
+			if offset > len(data) {
+				return nil
+			}
+			return data[offset:]
+		}
+		offset += chunkSize
+		if chunkSize%2 == 1 {
+			offset++
+		}
+	}
+	return nil
 }
 
 func spectrumFromPCM(data []byte, bands int, sampleRate int) ([]float64, error) {

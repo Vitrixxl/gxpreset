@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -82,5 +83,40 @@ func TestMeterTargetForNodeFallsBackToNodeName(t *testing.T) {
 
 	if got := meterTargetForNode(node); got != node.Name {
 		t.Fatalf("meterTargetForNode() = %q, want %q", got, node.Name)
+	}
+}
+
+func TestStripWAVHeader(t *testing.T) {
+	payload := []byte{1, 2, 3, 4}
+	header := make([]byte, 44)
+	copy(header[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(header[4:8], uint32(len(header)+len(payload)-8))
+	copy(header[8:12], "WAVE")
+	copy(header[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(header[16:20], 16)
+	copy(header[36:40], "data")
+	binary.LittleEndian.PutUint32(header[40:44], uint32(len(payload)))
+	data := append(header, payload...)
+
+	got := stripWAVHeader(data)
+	if string(got) != string(payload) {
+		t.Fatalf("stripWAVHeader() = %#v, want %#v", got, payload)
+	}
+}
+
+func TestMeterCommandSpecsIncludesCompatibilityFallback(t *testing.T) {
+	specs := meterCommandSpecs("alsa_output.usb:monitor_FL")
+	if len(specs) < 2 {
+		t.Fatalf("meterCommandSpecs() returned %d specs, want fallback", len(specs))
+	}
+	last := specs[len(specs)-1]
+	want := []string{"-r", "--target", "alsa_output.usb:monitor_FL", "-"}
+	if len(last.args) != len(want) {
+		t.Fatalf("fallback args = %#v, want %#v", last.args, want)
+	}
+	for i := range want {
+		if last.args[i] != want[i] {
+			t.Fatalf("fallback args = %#v, want %#v", last.args, want)
+		}
 	}
 }
