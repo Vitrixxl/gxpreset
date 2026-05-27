@@ -23,23 +23,20 @@ use std::{
     io::{self, Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use url::Url;
 
 const BASE_URL: &str = "https://musical-artifacts.com";
 const METER_SAMPLE_RATE: usize = 48_000;
-const METER_FRAME_SAMPLES: usize = 4096;
-const METER_BANDS: usize = 10;
-const SPECTRUM_LABELS: [&str; METER_BANDS] = [
-    "55", "90", "150", "250", "420", "700", "1k2", "2k", "4k", "8k+",
-];
+const METER_FRAME_SAMPLES: usize = 2400;
+const MAX_VOLUME_HISTORY: usize = 512;
 
 #[derive(Clone, Debug, Default)]
 struct Artifact {
@@ -72,8 +69,8 @@ struct AudioState {
     picking_target: bool,
     loading: bool,
     err: String,
-    spectrum: Vec<f64>,
-    spectrum_shown: Vec<f64>,
+    volume_level: f64,
+    volume_history: Vec<f64>,
     meter_source: String,
     meter_target: String,
     meter_err: String,
@@ -92,8 +89,8 @@ impl Default for AudioState {
             picking_target: false,
             loading: true,
             err: String::new(),
-            spectrum: Vec::new(),
-            spectrum_shown: Vec::new(),
+            volume_level: 0.0,
+            volume_history: Vec::new(),
             meter_source: String::new(),
             meter_target: String::new(),
             meter_err: String::new(),
@@ -165,6 +162,7 @@ struct Args {
 enum Tab {
     Library,
     Audio,
+    Recordings,
     Guitarix,
 }
 
@@ -172,6 +170,22 @@ enum Tab {
 enum Mode {
     Browse,
     Search,
+    RenameRecording,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RecordingItem {
+    path: PathBuf,
+    name: String,
+    size: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RecordingsState {
+    items: Vec<RecordingItem>,
+    selected: usize,
+    loading: bool,
+    err: String,
 }
 
 struct App {
@@ -199,9 +213,12 @@ struct App {
     download_seen: Arc<Mutex<HashSet<String>>>,
     stats: DownloaderStats,
     audio: AudioState,
+    recordings: RecordingsState,
     guitarix: GuitarixState,
     meter: Option<MeterControl>,
     meter_seq: u64,
+    recording: Option<RecordingControl>,
+    playback: Option<PlaybackControl>,
 }
 
 struct MeterControl {
@@ -209,6 +226,17 @@ struct MeterControl {
     source: String,
     target: String,
     cancel: Arc<AtomicBool>,
+}
+
+struct RecordingControl {
+    path: PathBuf,
+    started: Instant,
+    child: Child,
+}
+
+struct PlaybackControl {
+    path: PathBuf,
+    child: Child,
 }
 
 #[derive(Debug)]
@@ -236,9 +264,10 @@ enum AppEvent {
         id: u64,
         source: String,
         target: String,
-        spectrum: Vec<f64>,
+        level: f64,
         err: String,
     },
+    Recordings(Result<Vec<RecordingItem>, String>),
 }
 
 #[derive(Debug)]
@@ -353,20 +382,29 @@ fn run_tui(client: Client, args: Args, deps: DependencyStatus) -> Result<()> {
         download_seen: Arc::new(Mutex::new(HashSet::new())),
         stats: DownloaderStats::default(),
         audio: AudioState::default(),
+        recordings: RecordingsState {
+            loading: true,
+            ..RecordingsState::default()
+        },
         guitarix: GuitarixState {
             loading: true,
             ..GuitarixState::default()
         },
         meter: None,
         meter_seq: 0,
+        recording: None,
+        playback: None,
     };
 
     spawn_fetch(&app);
     spawn_audio_refresh(&app);
+    spawn_recordings_refresh(&app);
     spawn_guitarix_refresh(&app, String::new());
 
     let result = tui_loop(&mut terminal, &mut app, rx);
     app.stop_meter();
+    app.stop_recording();
+    app.stop_playback();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -379,7 +417,7 @@ fn tui_loop(
     rx: Receiver<AppEvent>,
 ) -> Result<()> {
     let mut last_draw = Instant::now() - Duration::from_secs(1);
-    let frame_time = Duration::from_millis(33);
+    let frame_time = Duration::from_millis(50);
     let mut dirty = true;
     loop {
         while event::poll(Duration::from_millis(2))? {
@@ -401,7 +439,11 @@ fn tui_loop(
             }
         }
 
-        if dirty || last_draw.elapsed() >= frame_time {
+        if app.poll_processes() {
+            dirty = true;
+        }
+
+        if dirty && last_draw.elapsed() >= frame_time {
             terminal.draw(|frame| render(frame, app))?;
             last_draw = Instant::now();
             dirty = false;
@@ -419,6 +461,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.mode == Mode::Search {
         return handle_search_key(app, key);
     }
+    if app.mode == Mode::RenameRecording {
+        return handle_rename_recording_key(app, key);
+    }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.quitting = true;
@@ -435,7 +480,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Tab => {
             app.active_tab = match app.active_tab {
                 Tab::Library => Tab::Audio,
-                Tab::Audio => Tab::Guitarix,
+                Tab::Audio => Tab::Recordings,
+                Tab::Recordings => Tab::Guitarix,
                 Tab::Guitarix => Tab::Library,
             };
             if app.active_tab != Tab::Audio {
@@ -449,6 +495,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     match app.active_tab {
         Tab::Library => handle_library_key(app, key),
         Tab::Audio => handle_audio_key(app, key),
+        Tab::Recordings => handle_recordings_key(app, key),
         Tab::Guitarix => handle_guitarix_key(app, key),
     }
 }
@@ -548,6 +595,7 @@ fn handle_audio_key(app: &mut App, key: KeyEvent) -> bool {
             app.audio.loading = true;
             spawn_audio_refresh(app);
         }
+        KeyCode::Char('R') => toggle_recording(app),
         KeyCode::Enter | KeyCode::Char('c') => {
             if app.audio.focus == AudioFocus::Connections {
                 app.audio.picking_target = true;
@@ -579,6 +627,184 @@ fn handle_audio_key(app: &mut App, key: KeyEvent) -> bool {
         _ => return false,
     }
     true
+}
+
+fn handle_recordings_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.recordings.selected = app.recordings.selected.saturating_sub(1)
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.recordings.selected + 1 < app.recordings.items.len() {
+                app.recordings.selected += 1;
+            }
+        }
+        KeyCode::Home => app.recordings.selected = 0,
+        KeyCode::End => {
+            app.recordings.selected = app.recordings.items.len().saturating_sub(1);
+        }
+        KeyCode::Char('r') => {
+            app.recordings.loading = true;
+            spawn_recordings_refresh(app);
+        }
+        KeyCode::Enter | KeyCode::Char('p') => start_playback(app),
+        KeyCode::Char('s') => app.stop_playback(),
+        KeyCode::Char('e') => start_rename_recording(app),
+        KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => delete_selected_recording(app),
+        _ => return false,
+    }
+    true
+}
+
+fn handle_rename_recording_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => finish_rename_recording(app),
+        KeyCode::Esc => {
+            app.input.clear();
+            app.mode = Mode::Browse;
+        }
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.input.clear(),
+        KeyCode::Char(c) => app.input.push(c),
+        _ => return false,
+    }
+    true
+}
+
+fn toggle_recording(app: &mut App) {
+    if app.recording.is_some() {
+        app.stop_recording();
+        return;
+    }
+
+    let node = app.selected_meter_source();
+    if node.name.is_empty() {
+        app.add_log("record failed: no meter source selected");
+        return;
+    }
+    let target = meter_target_for_node(&node);
+    if target.is_empty() {
+        app.add_log("record failed: no capture target");
+        return;
+    }
+
+    let dir = recordings_dir();
+    if let Err(err) = fs::create_dir_all(&dir) {
+        app.add_log(format!("record failed: {}", err));
+        return;
+    }
+    let path = dir.join(format!("rec-{}.wav", unix_timestamp_ms()));
+    match spawn_record_command(&target, &path) {
+        Ok(child) => {
+            app.recording = Some(RecordingControl {
+                path: path.clone(),
+                started: Instant::now(),
+                child,
+            });
+            app.audio.meter_source = node.name;
+            app.audio.meter_target = target;
+            app.add_log(format!("recording: {}", path.display()));
+        }
+        Err(err) => app.add_log(format!("record failed: {}", err)),
+    }
+}
+
+fn start_playback(app: &mut App) {
+    let Some(item) = app.selected_recording() else {
+        app.add_log("playback failed: no recording selected");
+        return;
+    };
+    app.stop_playback();
+    match spawn_playback_command(&item.path) {
+        Ok(child) => {
+            app.playback = Some(PlaybackControl {
+                path: item.path.clone(),
+                child,
+            });
+            app.add_log(format!("playing: {}", item.path.display()));
+        }
+        Err(err) => app.add_log(format!("playback failed: {}", err)),
+    }
+}
+
+fn start_rename_recording(app: &mut App) {
+    let Some(item) = app.selected_recording() else {
+        app.add_log("rename failed: no recording selected");
+        return;
+    };
+    app.input = item
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&item.name)
+        .to_string();
+    app.mode = Mode::RenameRecording;
+}
+
+fn finish_rename_recording(app: &mut App) {
+    let Some(item) = app.selected_recording() else {
+        app.mode = Mode::Browse;
+        app.input.clear();
+        return;
+    };
+    let basename = sanitize_recording_name(&app.input);
+    let dest = item.path.with_file_name(format!("{}.wav", basename));
+    app.mode = Mode::Browse;
+    app.input.clear();
+    if dest == item.path {
+        return;
+    }
+    if dest.exists() {
+        app.add_log(format!("rename failed: {} already exists", dest.display()));
+        return;
+    }
+    if app
+        .playback
+        .as_ref()
+        .is_some_and(|playback| playback.path == item.path)
+    {
+        app.stop_playback();
+    }
+    match fs::rename(&item.path, &dest) {
+        Ok(()) => {
+            app.add_log(format!("renamed: {}", dest.display()));
+            app.recordings.loading = true;
+            spawn_recordings_refresh(app);
+        }
+        Err(err) => app.add_log(format!("rename failed: {}", err)),
+    }
+}
+
+fn delete_selected_recording(app: &mut App) {
+    let Some(item) = app.selected_recording() else {
+        app.add_log("delete failed: no recording selected");
+        return;
+    };
+    if app
+        .playback
+        .as_ref()
+        .is_some_and(|playback| playback.path == item.path)
+    {
+        app.stop_playback();
+    }
+    if app
+        .recording
+        .as_ref()
+        .is_some_and(|recording| recording.path == item.path)
+    {
+        app.add_log("delete skipped: recording is still active");
+        return;
+    }
+    match fs::remove_file(&item.path) {
+        Ok(()) => {
+            app.add_log(format!("deleted recording: {}", item.path.display()));
+            app.recordings.loading = true;
+            spawn_recordings_refresh(app);
+        }
+        Err(err) => app.add_log(format!("delete failed: {}", err)),
+    }
 }
 
 fn handle_audio_picker_key(app: &mut App, key: KeyEvent) -> bool {
@@ -712,6 +938,57 @@ impl App {
         self.meter = None;
     }
 
+    fn stop_recording(&mut self) {
+        if let Some(mut recording) = self.recording.take() {
+            interrupt_child(&mut recording.child);
+            self.add_log(format!("record saved: {}", recording.path.display()));
+            self.recordings.loading = true;
+            spawn_recordings_refresh(self);
+        }
+    }
+
+    fn stop_playback(&mut self) {
+        if let Some(mut playback) = self.playback.take() {
+            interrupt_child(&mut playback.child);
+            self.add_log(format!("playback stopped: {}", playback.path.display()));
+        }
+    }
+
+    fn poll_processes(&mut self) -> bool {
+        let recording_done = if let Some(recording) = self.recording.as_mut() {
+            match recording.child.try_wait() {
+                Ok(Some(status)) => Some((recording.path.clone(), status.to_string())),
+                Ok(None) => None,
+                Err(err) => Some((recording.path.clone(), err.to_string())),
+            }
+        } else {
+            None
+        };
+        if let Some((path, status)) = recording_done {
+            self.recording = None;
+            self.add_log(format!("recording ended: {} ({})", path.display(), status));
+            self.recordings.loading = true;
+            spawn_recordings_refresh(self);
+            return true;
+        }
+
+        let playback_done = if let Some(playback) = self.playback.as_mut() {
+            match playback.child.try_wait() {
+                Ok(Some(_)) => Some(playback.path.clone()),
+                Ok(None) => None,
+                Err(_) => Some(playback.path.clone()),
+            }
+        } else {
+            None
+        };
+        if let Some(path) = playback_done {
+            self.playback = None;
+            self.add_log(format!("playback done: {}", path.display()));
+            return true;
+        }
+        false
+    }
+
     fn selected_output(&self) -> AudioNode {
         self.audio
             .outputs
@@ -738,6 +1015,10 @@ impl App {
 
     fn selected_meter_source_name(&self) -> String {
         self.selected_meter_source().name
+    }
+
+    fn selected_recording(&self) -> Option<RecordingItem> {
+        self.recordings.items.get(self.recordings.selected).cloned()
     }
 
     fn selected_bank(&self) -> String {
@@ -906,7 +1187,7 @@ fn apply_event(app: &mut App, event: AppEvent) {
             id,
             source,
             target,
-            spectrum,
+            level,
             err,
         } => {
             if app.meter.as_ref().is_none_or(|meter| meter.id != id) {
@@ -920,9 +1201,26 @@ fn apply_event(app: &mut App, event: AppEvent) {
             app.audio.meter_err.clear();
             app.audio.meter_source = source;
             app.audio.meter_target = target;
-            app.audio.spectrum = spectrum.clone();
-            app.audio.spectrum_shown =
-                smooth_display_spectrum(&app.audio.spectrum_shown, &spectrum);
+            let shown = smooth_volume(app.audio.volume_level, level);
+            app.audio.volume_level = shown;
+            app.audio.volume_history.insert(0, shown);
+            if app.audio.volume_history.len() > MAX_VOLUME_HISTORY {
+                app.audio.volume_history.truncate(MAX_VOLUME_HISTORY);
+            }
+        }
+        AppEvent::Recordings(result) => {
+            app.recordings.loading = false;
+            match result {
+                Ok(items) => {
+                    app.recordings.err.clear();
+                    app.recordings.items = items;
+                    app.recordings.selected = app
+                        .recordings
+                        .selected
+                        .min(app.recordings.items.len().saturating_sub(1));
+                }
+                Err(err) => app.recordings.err = err,
+            }
         }
     }
 }
@@ -1051,6 +1349,7 @@ fn render(frame: &mut Frame, app: &App) {
     match app.active_tab {
         Tab::Library => render_library(frame, app, chunks[1]),
         Tab::Audio => render_audio(frame, app, chunks[1]),
+        Tab::Recordings => render_recordings(frame, app, chunks[1]),
         Tab::Guitarix => render_guitarix(frame, app, chunks[1]),
     }
     render_footer(frame, app, chunks[2]);
@@ -1075,6 +1374,8 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         tab_span(app, Tab::Library, "Library"),
         Span::raw(" "),
         tab_span(app, Tab::Audio, "Audio"),
+        Span::raw(" "),
+        tab_span(app, Tab::Recordings, "Records"),
         Span::raw(" "),
         tab_span(app, Tab::Guitarix, "Guitarix"),
     ];
@@ -1128,6 +1429,27 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             },
         ),
     ])];
+    if let Some(recording) = &app.recording {
+        lines[0].spans.push(Span::raw(" "));
+        lines[0].spans.push(Span::styled(
+            format!("rec {}", format_elapsed(recording.started.elapsed())),
+            error_style(),
+        ));
+    }
+    if let Some(playback) = &app.playback {
+        lines[0].spans.push(Span::raw(" "));
+        lines[0].spans.push(Span::styled(
+            format!(
+                "play {}",
+                playback
+                    .path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("recording.wav")
+            ),
+            active_badge_style(),
+        ));
+    }
     if !app.deps.missing.is_empty() {
         lines.push(Line::from(Span::styled(
             format!("install: {}", app.deps.install_command()),
@@ -1290,15 +1612,17 @@ fn render_artifact_detail(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_audio(frame: &mut Frame, app: &App, area: Rect) {
-    let conn_h = ((area.height as f32 * 0.42) as u16)
-        .clamp(8, 15)
-        .min(area.height.saturating_sub(7));
+    let conn_h = if area.height >= 22 {
+        11
+    } else {
+        area.height.saturating_sub(8).clamp(6, 10)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(conn_h), Constraint::Min(7)])
+        .constraints([Constraint::Min(8), Constraint::Length(conn_h)])
         .split(area);
-    render_connections(frame, app, chunks[0]);
-    render_meter(frame, app, chunks[1]);
+    render_meter(frame, app, chunks[0]);
+    render_connections(frame, app, chunks[1]);
 }
 
 fn render_connections(frame: &mut Frame, app: &App, area: Rect) {
@@ -1499,7 +1823,7 @@ fn render_selected_source(frame: &mut Frame, app: &App, area: Rect) {
 fn render_meter(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Block::default()
-            .title(" Meter ")
+            .title(" Visualizer ")
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(if app.audio.focus == AudioFocus::Meter {
@@ -1527,7 +1851,7 @@ fn render_meter(frame: &mut Frame, app: &App, area: Rect) {
             app.audio.focus == AudioFocus::Meter,
             &app.audio,
         );
-        render_spectrum(frame, app, chunks[1]);
+        render_volume_visualizer(frame, app, chunks[1]);
     } else {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1542,11 +1866,11 @@ fn render_meter(frame: &mut Frame, app: &App, area: Rect) {
             app.audio.focus == AudioFocus::Meter,
             &app.audio,
         );
-        render_spectrum(frame, app, chunks[1]);
+        render_volume_visualizer(frame, app, chunks[1]);
     }
 }
 
-fn render_spectrum(frame: &mut Frame, app: &App, area: Rect) {
+fn render_volume_visualizer(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     let source = if app.audio.meter_source.is_empty() {
         app.selected_meter_source_name()
@@ -1563,26 +1887,31 @@ fn render_spectrum(frame: &mut Frame, app: &App, area: Rect) {
             muted_style(),
         )));
     }
-    let band_h = area
-        .height
-        .saturating_sub(lines.len() as u16 + if app.audio.meter_err.is_empty() { 0 } else { 1 })
-        as usize;
-    let values = if app.audio.spectrum_shown.is_empty() {
-        vec![0.0; METER_BANDS]
-    } else {
-        resample_spectrum(&app.audio.spectrum_shown, METER_BANDS)
-    };
-    let max_bars = band_h.min(METER_BANDS).max(1);
-    for i in 0..max_bars {
-        let value = values.get(i).copied().unwrap_or_default();
-        let width = area.width.saturating_sub(7) as usize;
-        let filled = ((value.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-        let empty = width.saturating_sub(filled);
-        let color = spectrum_color(i, METER_BANDS);
+    if let Some(recording) = &app.recording {
         lines.push(Line::from(vec![
-            Span::styled(format!("{:>4} ", SPECTRUM_LABELS[i]), muted_style()),
-            Span::styled("█".repeat(filled), Style::default().fg(color)),
-            Span::styled("░".repeat(empty), muted_style()),
+            Span::styled("record: ", muted_style()),
+            Span::styled(
+                format!(
+                    "REC {}  {}",
+                    format_elapsed(recording.started.elapsed()),
+                    truncate(
+                        recording
+                            .path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("recording.wav"),
+                        area.width.saturating_sub(16) as usize
+                    )
+                ),
+                error_style(),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("record: ", muted_style()),
+            Span::styled("off", muted_style()),
+            Span::raw("  "),
+            Span::styled("R start", accent_style()),
         ]));
     }
     if !app.audio.meter_err.is_empty() {
@@ -1594,7 +1923,150 @@ fn render_spectrum(frame: &mut Frame, app: &App, area: Rect) {
             muted_style(),
         )));
     }
+    let wave_h = area.height.saturating_sub(lines.len() as u16).max(1) as usize;
+    lines.extend(volume_wave_lines(
+        &app.audio.volume_history,
+        area.width as usize,
+        wave_h,
+    ));
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_recordings(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width >= 96 {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(area);
+        render_recordings_list(frame, app, chunks[0]);
+        render_recording_detail(frame, app, chunks[1]);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Min(6)])
+            .split(area);
+        render_recordings_list(frame, app, chunks[0]);
+        render_recording_detail(frame, app, chunks[1]);
+    }
+}
+
+fn render_recordings_list(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if app.recordings.loading && app.recordings.items.is_empty() {
+        lines.push(Line::from(Span::styled(" loading ", active_badge_style())));
+        lines.push(Line::from(Span::styled(
+            recordings_dir().display().to_string(),
+            muted_style(),
+        )));
+    } else if !app.recordings.err.is_empty() && app.recordings.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            app.recordings.err.clone(),
+            error_style(),
+        )));
+    } else if app.recordings.items.is_empty() {
+        lines.push(Line::from(Span::styled("No recordings.", muted_style())));
+        lines.push(Line::from(Span::styled(
+            "Use R in the Audio tab to record the selected meter source.",
+            muted_style(),
+        )));
+    } else {
+        let max_rows = area.height.saturating_sub(2) as usize;
+        let top = if app.recordings.selected >= max_rows {
+            app.recordings.selected - max_rows + 1
+        } else {
+            0
+        };
+        for i in top..(top + max_rows).min(app.recordings.items.len()) {
+            let item = &app.recordings.items[i];
+            let size = human_size(item.size);
+            let width = area.width.saturating_sub(18).max(8) as usize;
+            let line = format!(
+                "{:2}. {:width$} {}",
+                i + 1,
+                truncate(&item.name, width),
+                size,
+                width = width
+            );
+            lines.push(Line::from(Span::styled(
+                line,
+                if i == app.recordings.selected {
+                    selected_style()
+                } else {
+                    item_style()
+                },
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(panel_block("Recordings", true)),
+        area,
+    );
+}
+
+fn render_recording_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if app.mode == Mode::RenameRecording {
+        lines.push(Line::from(Span::styled("Rename", accent_style())));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" {}_ ", app.input),
+            selected_style(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "enter save  esc cancel",
+            muted_style(),
+        )));
+    } else if let Some(item) = app.selected_recording() {
+        lines.push(label_line("File", &item.name, area.width as usize));
+        lines.push(label_line(
+            "Size",
+            &human_size(item.size),
+            area.width as usize,
+        ));
+        lines.push(label_line(
+            "Path",
+            &item.path.display().to_string(),
+            area.width as usize,
+        ));
+        if let Some(playback) = &app.playback {
+            let status = if playback.path == item.path {
+                "playing selected"
+            } else {
+                "playing another file"
+            };
+            lines.push(label_line("Playback", status, area.width as usize));
+        } else {
+            lines.push(label_line("Playback", "stopped", area.width as usize));
+        }
+        if let Some(recording) = &app.recording {
+            lines.push(label_line(
+                "Recording",
+                &format!(
+                    "{} {}",
+                    format_elapsed(recording.started.elapsed()),
+                    recording.path.display()
+                ),
+                area.width as usize,
+            ));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "enter/p play  s stop  e rename  x delete",
+            muted_style(),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No recording selected.",
+            muted_style(),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(panel_block("Details", false)),
+        area,
+    );
 }
 
 fn render_guitarix(frame: &mut Frame, app: &App, area: Rect) {
@@ -1843,6 +2315,14 @@ fn spawn_audio_action(app: &App, out: AudioNode, input: AudioNode, disconnect: b
     });
 }
 
+fn spawn_recordings_refresh(app: &App) {
+    let tx = app.tx.clone();
+    thread::spawn(move || {
+        let result = list_recordings().map_err(|err| err.to_string());
+        let _ = tx.send(AppEvent::Recordings(result));
+    });
+}
+
 fn spawn_guitarix_refresh(app: &App, preferred_bank: String) {
     let tx = app.tx.clone();
     thread::spawn(move || {
@@ -1964,6 +2444,8 @@ fn ensure_meter_stream(app: &mut App) -> bool {
     app.audio.meter_source = source.clone();
     app.audio.meter_target = target.clone();
     app.audio.meter_err.clear();
+    app.audio.volume_level = 0.0;
+    app.audio.volume_history.clear();
     let tx = app.tx.clone();
     thread::spawn(move || run_meter_stream(id, source, target, cancel, tx));
     true
@@ -2318,7 +2800,7 @@ fn run_meter_stream(
                 id,
                 source,
                 target,
-                spectrum: Vec::new(),
+                level: 0.0,
                 err: err.to_string(),
             });
             return;
@@ -2344,7 +2826,7 @@ fn run_meter_stream(
             id,
             source,
             target,
-            spectrum: Vec::new(),
+            level: 0.0,
             err: last_err,
         });
     }
@@ -2412,14 +2894,14 @@ fn run_meter_command(
                 if data.len() < 2 {
                     continue;
                 }
-                match spectrum_from_pcm(data, METER_BANDS, METER_SAMPLE_RATE) {
-                    Ok(spectrum) => {
+                match volume_from_pcm(data) {
+                    Ok(level) => {
                         frames += 1;
                         let _ = tx.send(AppEvent::Meter {
                             id,
                             source: source.to_string(),
                             target: target.to_string(),
-                            spectrum,
+                            level,
                             err: String::new(),
                         });
                     }
@@ -2428,7 +2910,7 @@ fn run_meter_command(
                             id,
                             source: source.to_string(),
                             target: target.to_string(),
-                            spectrum: Vec::new(),
+                            level: 0.0,
                             err: err.to_string(),
                         });
                     }
@@ -2474,118 +2956,171 @@ fn strip_wav_header(data: &[u8]) -> &[u8] {
     &[]
 }
 
-fn spectrum_from_pcm(data: &[u8], bands: usize, sample_rate: usize) -> Result<Vec<f64>> {
+fn volume_from_pcm(data: &[u8]) -> Result<f64> {
     if data.len() < 2 {
         return Err(anyhow::anyhow!("no PCM data"));
     }
-    let bands = bands.max(8);
-    let mut samples = Vec::with_capacity(data.len() / 2);
+    let count = data.chunks_exact(2).len();
+    if count == 0 {
+        return Err(anyhow::anyhow!("no PCM samples"));
+    }
     let mut mean = 0.0;
     for chunk in data.chunks_exact(2) {
         let v = i16::from_le_bytes([chunk[0], chunk[1]]) as f64 / 32768.0;
-        samples.push(v);
         mean += v;
     }
-    if samples.is_empty() {
-        return Err(anyhow::anyhow!("no PCM samples"));
+    mean /= count as f64;
+    let mut sum = 0.0;
+    let mut peak = 0.0_f64;
+    for chunk in data.chunks_exact(2) {
+        let v = i16::from_le_bytes([chunk[0], chunk[1]]) as f64 / 32768.0;
+        let centered = v - mean;
+        sum += centered * centered;
+        peak = peak.max(centered.abs());
     }
-    mean /= samples.len() as f64;
-    let denom = (samples.len().saturating_sub(1)).max(1) as f64;
-    for (i, sample) in samples.iter_mut().enumerate() {
-        let window = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / denom).cos();
-        *sample = (*sample - mean) * window;
-    }
-    let mut spectrum = vec![0.0; bands];
-    let min_freq = 55.0;
-    let max_freq = 12_000.0;
-    for (band, slot) in spectrum.iter_mut().enumerate() {
-        let t = band as f64 / (bands.saturating_sub(1)).max(1) as f64;
-        let freq = min_freq * f64::powf(max_freq / min_freq, t);
-        let center = ((freq * samples.len() as f64 / sample_rate as f64).round() as isize).max(1);
-        let mut max_power = 0.0;
-        for k in center - 1..=center + 1 {
-            if k <= 0 || k as usize >= samples.len() / 2 {
-                continue;
-            }
-            max_power = f64::max(max_power, goertzel_power(&samples, k as usize));
+    let rms = (sum / count as f64).sqrt();
+    let combined = (rms * 0.82 + peak * 0.18).clamp(0.0, 1.0);
+    let db = 20.0 * (combined + 1e-7).log10();
+    Ok(((db + 60.0) / 42.0).clamp(0.0, 1.0).sqrt())
+}
+
+fn smooth_volume(previous: f64, next: f64) -> f64 {
+    let mixed = if next > previous {
+        previous * 0.15 + next * 0.85
+    } else {
+        previous * 0.62 + next * 0.38
+    };
+    mixed.clamp(0.0, 1.0)
+}
+
+fn list_recordings() -> Result<Vec<RecordingItem>> {
+    let dir = recordings_dir();
+    fs::create_dir_all(&dir)?;
+    let mut items = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+        {
+            continue;
         }
-        let amp = max_power.sqrt() * 2.0 / samples.len() as f64;
-        let db = 20.0 * (amp + 1e-7).log10();
-        let level = ((db + 72.0) / 54.0).clamp(0.0, 1.0);
-        *slot = level.sqrt();
-    }
-    Ok(smooth_spectrum(&spectrum))
-}
-
-fn goertzel_power(samples: &[f64], k: usize) -> f64 {
-    let w = 2.0 * std::f64::consts::PI * k as f64 / samples.len() as f64;
-    let coeff = 2.0 * w.cos();
-    let (mut q1, mut q2) = (0.0, 0.0);
-    for sample in samples {
-        let q0 = coeff * q1 - q2 + sample;
-        q2 = q1;
-        q1 = q0;
-    }
-    q1 * q1 + q2 * q2 - coeff * q1 * q2
-}
-
-fn smooth_spectrum(values: &[f64]) -> Vec<f64> {
-    if values.len() < 3 {
-        return values.to_vec();
-    }
-    let mut out = vec![0.0; values.len()];
-    for i in 0..values.len() {
-        let mut sum = values[i] * 0.5;
-        let mut weight = 0.5;
-        if i > 0 {
-            sum += values[i - 1] * 0.25;
-            weight += 0.25;
+        let meta = entry.metadata()?;
+        if !meta.is_file() {
+            continue;
         }
-        if i + 1 < values.len() {
-            sum += values[i + 1] * 0.25;
-            weight += 0.25;
+        items.push(RecordingItem {
+            name: path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("recording.wav")
+                .to_string(),
+            path,
+            size: meta.len(),
+        });
+    }
+    items.sort_by(|a, b| b.name.cmp(&a.name));
+    Ok(items)
+}
+
+fn spawn_record_command(target: &str, path: &Path) -> Result<Child> {
+    Command::new(command_path("pw-cat")?)
+        .arg("-r")
+        .arg("--target")
+        .arg(target)
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("start pw-cat recording")
+}
+
+fn spawn_playback_command(path: &Path) -> Result<Child> {
+    let mut errors = Vec::new();
+    if let Ok(cmd) = command_path("pw-cat") {
+        match Command::new(&cmd)
+            .arg("-p")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(err) => errors.push(format!("pw-cat: {}", err)),
         }
-        out[i] = sum / weight;
     }
-    out
+    if let Ok(cmd) = command_path("pw-play") {
+        match Command::new(&cmd)
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(err) => errors.push(format!("pw-play: {}", err)),
+        }
+    }
+    if errors.is_empty() {
+        Err(anyhow::anyhow!("pw-cat/pw-play not found"))
+    } else {
+        Err(anyhow::anyhow!(errors.join("; ")))
+    }
 }
 
-fn smooth_display_spectrum(previous: &[f64], next: &[f64]) -> Vec<f64> {
-    if next.is_empty() {
-        return Vec::new();
+fn interrupt_child(child: &mut Child) {
+    let pid = child.id().to_string();
+    let _ = Command::new("kill")
+        .arg("-INT")
+        .arg(&pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let deadline = Instant::now() + Duration::from_millis(700);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(30)),
+            Err(_) => return,
+        }
     }
-    if previous.len() != next.len() {
-        return next.to_vec();
-    }
-    next.iter()
-        .zip(previous.iter())
-        .map(|(value, prev)| {
-            let out = if value > prev {
-                prev * 0.10 + value * 0.90
-            } else {
-                prev * 0.45 + value * 0.55
-            };
-            out.clamp(0.0, 1.0)
-        })
-        .collect()
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
-fn resample_spectrum(values: &[f64], count: usize) -> Vec<f64> {
-    if count == 0 || values.is_empty() {
-        return Vec::new();
+fn recordings_dir() -> PathBuf {
+    env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("gxpreset")
+        .join("recordings")
+}
+
+fn unix_timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn sanitize_recording_name(input: &str) -> String {
+    let mut out = String::new();
+    for c in input.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+            out.push(c);
+        } else if c.is_whitespace() {
+            out.push('_');
+        }
     }
-    if values.len() == count {
-        return values.to_vec();
+    let out = out.trim_matches('.').trim_matches('_').to_string();
+    let out = out.trim_end_matches(".wav").trim_end_matches(".WAV");
+    if out.is_empty() {
+        "recording".to_string()
+    } else {
+        out.to_string()
     }
-    let mut out = vec![0.0; count];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let pos = i as f64 * (values.len() - 1) as f64 / count.saturating_sub(1).max(1) as f64;
-        let lo = pos.floor() as usize;
-        let hi = pos.ceil() as usize;
-        let frac = pos - lo as f64;
-        *slot = values[lo] * (1.0 - frac) + values[hi.min(values.len() - 1)] * frac;
-    }
-    out
 }
 
 fn guitarix_snapshot(preferred_bank: &str) -> Result<GuitarixSnapshot> {
@@ -2828,7 +3363,7 @@ fn required_system_dependencies() -> Vec<SystemDependency> {
         SystemDependency {
             command: "pw-cat",
             package: "pipewire-bin",
-            usage: "audio meter capture",
+            usage: "audio meter, recording and playback",
         },
         SystemDependency {
             command: "pw-jack",
@@ -2947,6 +3482,44 @@ fn print_page(query: &str, order: &str, page: usize, raw_url: &str, items: &[Art
     }
 }
 
+fn volume_wave_lines(history: &[f64], width: usize, height: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let center = height / 2;
+    let bar_style = Style::default().fg(Color::Rgb(59, 130, 246));
+    let mut lines = Vec::with_capacity(height);
+    for y in 0..height {
+        let mut row = String::with_capacity(width);
+        for x in 0..width {
+            let value = history.get(x).copied().unwrap_or_default().clamp(0.0, 1.0);
+            let half = if value < 0.015 {
+                0
+            } else {
+                ((value * center.max(1) as f64).ceil() as usize).max(1)
+            };
+            let dist = y.abs_diff(center);
+            row.push(if half > 0 && dist <= half { '┃' } else { ' ' });
+        }
+        lines.push(Line::from(Span::styled(row, bar_style)));
+    }
+    lines
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1}M", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
 fn tab_span(app: &App, tab: Tab, label: &str) -> Span<'static> {
     Span::styled(
         label.to_string(),
@@ -3019,22 +3592,6 @@ fn border_style() -> Style {
     Style::default().fg(Color::Rgb(51, 65, 85))
 }
 
-fn spectrum_color(index: usize, count: usize) -> Color {
-    let colors = [
-        Color::Rgb(34, 197, 94),
-        Color::Rgb(132, 204, 22),
-        Color::Rgb(234, 179, 8),
-        Color::Rgb(249, 115, 22),
-        Color::Rgb(239, 68, 68),
-    ];
-    let pos = if count <= 1 {
-        0
-    } else {
-        index * (colors.len() - 1) / (count - 1)
-    };
-    colors[pos]
-}
-
 fn label_line(label: &str, value: &str, width: usize) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{}: ", label), muted_style()),
@@ -3044,7 +3601,8 @@ fn label_line(label: &str, value: &str, width: usize) -> Line<'static> {
 
 fn help_line(app: &App) -> String {
     match app.active_tab {
-        Tab::Audio => "tab view  h/left  l/right  up/down select  enter target picker  space toggle  x disconnect  r refresh  q quit  ? hide".to_string(),
+        Tab::Audio => "tab view  h/left connections  l/right visualizer  up/down select  enter picker  space toggle target  R record  r refresh  q quit  ? hide".to_string(),
+        Tab::Recordings => "tab view  up/down select  enter/p play  s stop  e rename  x delete  r refresh  q quit  ? hide".to_string(),
         Tab::Guitarix => "tab view  h banks  l presets  up/down select  enter/s switch preset  x delete bank  r refresh  q quit  ? hide".to_string(),
         Tab::Library => "tab view  up/down select  enter/d download  a all visible  / search  n/p page  o order  c crawl  r refresh  q quit  ? hide".to_string(),
     }

@@ -2,7 +2,7 @@
 
 Ratatui terminal UI for a small headless Guitarix/PipeWire rig.
 
-It can browse and download Guitarix presets from Musical Artifacts, inspect PipeWire audio nodes, connect sources to targets, show a lightweight spectrum meter, and control Guitarix banks/presets over its JSON-RPC interface.
+It can browse and download Guitarix presets from Musical Artifacts, inspect PipeWire audio nodes, connect sources to targets, show a lightweight volume-history visualizer, record the selected meter source, play/rename/delete recordings, and control Guitarix banks/presets over its JSON-RPC interface.
 
 The current implementation is Rust/Ratatui. The older Go prototype is still present in the repository as a reference during the migration.
 
@@ -78,5 +78,14 @@ Main keys:
 - `enter`: select/open/connect
 - `space`: toggle target connection in the audio target picker
 - `x`: disconnect or delete a Guitarix bank when focused
+- `R`: start/stop recording from the Audio visualizer
+- `p` / `s`: play or stop a recording in the Records tab
+- `e`: rename a recording in the Records tab
 - `r`: refresh
 - `q`: quit
+
+Recordings are saved as WAV files in:
+
+```sh
+${XDG_DATA_HOME:-$HOME/.local/share}/gxpreset/recordings
+```
