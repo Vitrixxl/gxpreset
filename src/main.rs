@@ -37,7 +37,7 @@ const BASE_URL: &str = "https://musical-artifacts.com";
 const METER_SAMPLE_RATE: usize = 48_000;
 const METER_FRAME_SAMPLES: usize = 2400;
 const MAX_VOLUME_HISTORY: usize = 512;
-const VOLUME_DB_FLOOR: f64 = -70.0;
+const VOLUME_DB_GATE: f64 = -38.0;
 const VOLUME_DB_CEILING: f64 = 0.0;
 const VISUALIZER_MAX_HEIGHT_RATIO: f64 = 0.72;
 
@@ -2981,9 +2981,12 @@ fn volume_from_pcm(data: &[u8]) -> Result<f64> {
     }
     let rms = (sum / count as f64).sqrt();
     let db = 20.0 * (rms + 1e-7).log10();
-    let span = VOLUME_DB_CEILING - VOLUME_DB_FLOOR;
-    let linear = ((db - VOLUME_DB_FLOOR) / span).clamp(0.0, 1.0);
-    Ok(linear.powf(1.8))
+    if db <= VOLUME_DB_GATE {
+        return Ok(0.0);
+    }
+    let span = VOLUME_DB_CEILING - VOLUME_DB_GATE;
+    let linear = ((db - VOLUME_DB_GATE) / span).clamp(0.0, 1.0);
+    Ok(linear.powf(1.45))
 }
 
 fn smooth_volume(previous: f64, next: f64) -> f64 {
@@ -3488,6 +3491,7 @@ fn volume_wave_lines(history: &[f64], width: usize, height: usize) -> Vec<Line<'
     let width = width.max(1);
     let height = height.max(1);
     let center = height / 2;
+    let radius = center.max(1) as f64;
     let bar_style = Style::default().fg(Color::Rgb(59, 130, 246));
     let mut lines = Vec::with_capacity(height);
     for y in 0..height {
@@ -3495,17 +3499,40 @@ fn volume_wave_lines(history: &[f64], width: usize, height: usize) -> Vec<Line<'
         for x in 0..width {
             let value = history.get(x).copied().unwrap_or_default().clamp(0.0, 1.0)
                 * VISUALIZER_MAX_HEIGHT_RATIO;
-            let half = if value < 0.015 {
-                0
-            } else {
-                ((value * center.max(1) as f64).ceil() as usize).max(1)
-            };
-            let dist = y.abs_diff(center);
-            row.push(if half > 0 && dist <= half { '┃' } else { ' ' });
+            if value <= 0.0001 {
+                row.push(' ');
+                continue;
+            }
+            let amplitude = value * radius;
+            let dist = y.abs_diff(center) as f64;
+            row.push(volume_unicode_char(amplitude + 0.5 - dist, y, center));
         }
         lines.push(Line::from(Span::styled(row, bar_style)));
     }
     lines
+}
+
+fn volume_unicode_char(coverage: f64, row: usize, center: usize) -> char {
+    if coverage < 0.16 {
+        return ' ';
+    }
+    if coverage >= 0.86 || row == center {
+        '┃'
+    } else if coverage >= 0.55 {
+        if row < center {
+            '╹'
+        } else {
+            '╻'
+        }
+    } else if coverage >= 0.16 {
+        if row < center {
+            '╵'
+        } else {
+            '╷'
+        }
+    } else {
+        ' '
+    }
 }
 
 fn format_elapsed(duration: Duration) -> String {
