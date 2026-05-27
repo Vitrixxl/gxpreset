@@ -16,9 +16,12 @@ cp target/release/gxpreset ./gxpreset
 On the ARM64 board, build natively with the same command after installing Rust:
 
 ```sh
-sudo apt install -y cargo
+curl https://sh.rustup.rs -sSf | sh
+. "$HOME/.cargo/env"
 cargo build --release
 ```
+
+Debian's `cargo` package can be too old. Cargo 1.65 cannot read the current `Cargo.lock` format.
 
 ## System dependencies
 
