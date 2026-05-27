@@ -37,6 +37,9 @@ const BASE_URL: &str = "https://musical-artifacts.com";
 const METER_SAMPLE_RATE: usize = 48_000;
 const METER_FRAME_SAMPLES: usize = 2400;
 const MAX_VOLUME_HISTORY: usize = 512;
+const VOLUME_DB_FLOOR: f64 = -70.0;
+const VOLUME_DB_CEILING: f64 = 0.0;
+const VISUALIZER_MAX_HEIGHT_RATIO: f64 = 0.72;
 
 #[derive(Clone, Debug, Default)]
 struct Artifact {
@@ -2971,17 +2974,16 @@ fn volume_from_pcm(data: &[u8]) -> Result<f64> {
     }
     mean /= count as f64;
     let mut sum = 0.0;
-    let mut peak = 0.0_f64;
     for chunk in data.chunks_exact(2) {
         let v = i16::from_le_bytes([chunk[0], chunk[1]]) as f64 / 32768.0;
         let centered = v - mean;
         sum += centered * centered;
-        peak = peak.max(centered.abs());
     }
     let rms = (sum / count as f64).sqrt();
-    let combined = (rms * 0.82 + peak * 0.18).clamp(0.0, 1.0);
-    let db = 20.0 * (combined + 1e-7).log10();
-    Ok(((db + 60.0) / 42.0).clamp(0.0, 1.0).sqrt())
+    let db = 20.0 * (rms + 1e-7).log10();
+    let span = VOLUME_DB_CEILING - VOLUME_DB_FLOOR;
+    let linear = ((db - VOLUME_DB_FLOOR) / span).clamp(0.0, 1.0);
+    Ok(linear.powf(1.8))
 }
 
 fn smooth_volume(previous: f64, next: f64) -> f64 {
@@ -3491,7 +3493,8 @@ fn volume_wave_lines(history: &[f64], width: usize, height: usize) -> Vec<Line<'
     for y in 0..height {
         let mut row = String::with_capacity(width);
         for x in 0..width {
-            let value = history.get(x).copied().unwrap_or_default().clamp(0.0, 1.0);
+            let value = history.get(x).copied().unwrap_or_default().clamp(0.0, 1.0)
+                * VISUALIZER_MAX_HEIGHT_RATIO;
             let half = if value < 0.015 {
                 0
             } else {
