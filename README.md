@@ -24,6 +24,20 @@ On Debian:
 sudo apt update && sudo apt install -y pipewire-bin pipewire-jack pipewire-audio guitarix
 ```
 
+For a PipeWire-only audio setup, make sure the user services are running and stop any old JACK daemon:
+
+```sh
+systemctl --user enable --now pipewire pipewire-pulse wireplumber
+pkill -x jackd 2>/dev/null || true
+pkill -x jackdbus 2>/dev/null || true
+```
+
+On a headless board where user services stop after logout, enable lingering once:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
 You can also ask the CLI to report missing dependencies:
 
 ```sh
@@ -31,6 +45,7 @@ You can also ask the CLI to report missing dependencies:
 ```
 
 The PipeWire tools are separate commands with hyphens: `pw-link`, `pw-cat`, and `pw-jack`.
+Run JACK apps through PipeWire with `pw-jack`, for example `pw-jack guitarix -N -p 7000`.
 
 ## Usage
 
