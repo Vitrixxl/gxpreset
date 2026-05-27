@@ -1,19 +1,23 @@
 # gxpreset
 
-Terminal UI for a small headless Guitarix/PipeWire rig.
+Ratatui terminal UI for a small headless Guitarix/PipeWire rig.
 
 It can browse and download Guitarix presets from Musical Artifacts, inspect PipeWire audio nodes, connect sources to targets, show a lightweight spectrum meter, and control Guitarix banks/presets over its JSON-RPC interface.
+
+The current implementation is Rust/Ratatui. The older Go prototype is still present in the repository as a reference during the migration.
 
 ## Build
 
 ```sh
-go build -trimpath -ldflags='-s -w' -o gxpreset .
+cargo build --release
+cp target/release/gxpreset ./gxpreset
 ```
 
-For ARM64 Linux:
+On the ARM64 board, build natively with the same command after installing Rust:
 
 ```sh
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o gxpreset-linux-arm64 .
+sudo apt install -y cargo
+cargo build --release
 ```
 
 ## System dependencies
