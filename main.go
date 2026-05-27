@@ -51,7 +51,7 @@ var guitarixLaunchMu sync.Mutex
 
 var (
 	appStyle = lipgloss.NewStyle().
-			Padding(0, 1)
+			Padding(2, 4)
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#0B1320")).
