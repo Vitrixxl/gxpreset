@@ -3490,8 +3490,8 @@ fn print_page(query: &str, order: &str, page: usize, raw_url: &str, items: &[Art
 fn volume_wave_lines(history: &[f64], width: usize, height: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let height = height.max(1);
-    let center = height / 2;
-    let radius = center.max(1) as f64;
+    let center = (height.saturating_sub(1)) as f64 / 2.0;
+    let radius = center.max((height as f64 - center - 1.0).abs()).max(1.0);
     let bar_style = Style::default().fg(Color::Rgb(59, 130, 246));
     let mut lines = Vec::with_capacity(height);
     for y in 0..height {
@@ -3504,34 +3504,28 @@ fn volume_wave_lines(history: &[f64], width: usize, height: usize) -> Vec<Line<'
                 continue;
             }
             let amplitude = value * radius;
-            let dist = y.abs_diff(center) as f64;
-            row.push(volume_unicode_char(amplitude + 0.5 - dist, y, center));
+            let dist = (y as f64 - center).abs();
+            row.push(volume_unicode_char(
+                amplitude + 0.5 - dist,
+                y as f64,
+                center,
+            ));
         }
         lines.push(Line::from(Span::styled(row, bar_style)));
     }
     lines
 }
 
-fn volume_unicode_char(coverage: f64, row: usize, center: usize) -> char {
-    if coverage < 0.16 {
+fn volume_unicode_char(coverage: f64, row: f64, center: f64) -> char {
+    if coverage < 0.08 {
         return ' ';
     }
-    if coverage >= 0.86 || row == center {
-        '┃'
-    } else if coverage >= 0.55 {
-        if row < center {
-            '╹'
-        } else {
-            '╻'
-        }
-    } else if coverage >= 0.16 {
-        if row < center {
-            '╵'
-        } else {
-            '╷'
-        }
+    if coverage >= 0.92 || (row - center).abs() < f64::EPSILON {
+        '█'
+    } else if row < center {
+        '▄'
     } else {
-        ' '
+        '▀'
     }
 }
 
