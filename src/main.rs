@@ -363,7 +363,7 @@ fn run_tui(client: Client, args: Args, deps: DependencyStatus) -> Result<()> {
     let mut app = App {
         client,
         tx: tx.clone(),
-        active_tab: Tab::Library,
+        active_tab: Tab::Audio,
         config,
         deps,
         query: args.query,
@@ -482,10 +482,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Tab => {
             app.active_tab = match app.active_tab {
-                Tab::Library => Tab::Audio,
-                Tab::Audio => Tab::Recordings,
+                Tab::Audio => Tab::Library,
+                Tab::Library => Tab::Recordings,
                 Tab::Recordings => Tab::Guitarix,
-                Tab::Guitarix => Tab::Library,
+                Tab::Guitarix => Tab::Audio,
             };
             if app.active_tab != Tab::Audio {
                 app.stop_meter();
@@ -1374,9 +1374,9 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         &app.query
     };
     let tabs = vec![
-        tab_span(app, Tab::Library, "Library"),
-        Span::raw(" "),
         tab_span(app, Tab::Audio, "Audio"),
+        Span::raw(" "),
+        tab_span(app, Tab::Library, "Library"),
         Span::raw(" "),
         tab_span(app, Tab::Recordings, "Records"),
         Span::raw(" "),
@@ -3497,10 +3497,17 @@ fn volume_wave_lines(history: &[f64], width: usize, height: usize) -> Vec<Line<'
     for y in 0..height {
         let mut row = String::with_capacity(width);
         for x in 0..width {
-            let value = history.get(x).copied().unwrap_or_default().clamp(0.0, 1.0)
-                * VISUALIZER_MAX_HEIGHT_RATIO;
-            if value <= 0.0001 {
+            let Some(raw_value) = history.get(x).copied() else {
                 row.push(' ');
+                continue;
+            };
+            let value = raw_value.clamp(0.0, 1.0) * VISUALIZER_MAX_HEIGHT_RATIO;
+            if value <= 0.0001 {
+                row.push(if (y as f64 - center).abs() < 0.5 {
+                    '─'
+                } else {
+                    ' '
+                });
                 continue;
             }
             let amplitude = value * radius;
