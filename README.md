@@ -21,7 +21,7 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o gxp
 On Debian:
 
 ```sh
-sudo apt install pipewire-bin pipewire-jack guitarix
+sudo apt update && sudo apt install -y pipewire-bin pipewire-jack pipewire-audio guitarix
 ```
 
 You can also ask the CLI to report missing dependencies:
@@ -29,6 +29,8 @@ You can also ask the CLI to report missing dependencies:
 ```sh
 ./gxpreset -deps
 ```
+
+The PipeWire tools are separate commands with hyphens: `pw-link`, `pw-cat`, and `pw-jack`.
 
 ## Usage
 
@@ -45,4 +47,3 @@ Main keys:
 - `x`: disconnect or delete a Guitarix bank when focused
 - `r`: refresh
 - `q`: quit
-

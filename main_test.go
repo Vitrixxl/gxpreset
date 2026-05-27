@@ -48,10 +48,11 @@ func TestSystemDependencyInstallCommandDeduplicatesPackages(t *testing.T) {
 		{Command: "pw-link", Package: "pipewire-bin"},
 		{Command: "pw-cat", Package: "pipewire-bin"},
 		{Command: "pw-jack", Package: "pipewire-jack"},
+		{Command: "wireplumber", Package: "pipewire-audio"},
 		{Command: "guitarix", Package: "guitarix"},
 	}}
 
-	want := "sudo apt update && sudo apt install -y pipewire-bin pipewire-jack guitarix"
+	want := "sudo apt update && sudo apt install -y pipewire-bin pipewire-jack pipewire-audio guitarix"
 	if got := status.InstallCommand(); got != want {
 		t.Fatalf("InstallCommand() = %q, want %q", got, want)
 	}

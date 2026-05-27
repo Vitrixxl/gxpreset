@@ -1547,6 +1547,7 @@ func requiredSystemDependencies() []SystemDependency {
 		{Command: "pw-link", Package: "pipewire-bin", Use: "PipeWire routing"},
 		{Command: "pw-cat", Package: "pipewire-bin", Use: "audio meter capture"},
 		{Command: "pw-jack", Package: "pipewire-jack", Use: "launch Guitarix through PipeWire JACK"},
+		{Command: "wireplumber", Package: "pipewire-audio", Use: "PipeWire audio session manager"},
 		{Command: "guitarix", Package: "guitarix", Use: "amp/effects engine and preset RPC"},
 	}
 }
