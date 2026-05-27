@@ -38,6 +38,17 @@ On a headless board where user services stop after logout, enable lingering once
 sudo loginctl enable-linger "$USER"
 ```
 
+If `systemctl --user` says `Failed to connect to bus: Host is down`, install the user D-Bus session support, enable the user's systemd instance, then reconnect or reboot:
+
+```sh
+sudo apt install -y dbus-user-session
+sudo loginctl enable-linger "$USER"
+sudo systemctl start "user@$(id -u).service"
+systemctl --user enable --now pipewire pipewire-pulse wireplumber
+```
+
+Do not run `pw-link`, `pw-cat`, `pw-jack`, or `systemctl --user` with `sudo`; they need the normal user's PipeWire socket in `/run/user/$(id -u)`.
+
 You can also ask the CLI to report missing dependencies:
 
 ```sh
