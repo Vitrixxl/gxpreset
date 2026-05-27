@@ -111,6 +111,8 @@ enum AudioFocus {
 struct GuitarixState {
     banks: Vec<String>,
     presets: Vec<String>,
+    presets_bank: String,
+    loading_bank: String,
     bank_selected: usize,
     preset_selected: usize,
     focus: usize,
@@ -291,6 +293,7 @@ struct AudioSnapshot {
 
 #[derive(Debug)]
 struct GuitarixSnapshot {
+    bank: String,
     banks: Vec<String>,
     presets: Vec<String>,
 }
@@ -481,15 +484,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::Tab => {
-            app.active_tab = match app.active_tab {
-                Tab::Audio => Tab::Library,
-                Tab::Library => Tab::Recordings,
-                Tab::Recordings => Tab::Guitarix,
-                Tab::Guitarix => Tab::Audio,
-            };
-            if app.active_tab != Tab::Audio {
-                app.stop_meter();
-            }
+            switch_tab(app, 1);
+            return true;
+        }
+        KeyCode::BackTab => {
+            switch_tab(app, -1);
             return true;
         }
         _ => {}
@@ -500,6 +499,23 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         Tab::Audio => handle_audio_key(app, key),
         Tab::Recordings => handle_recordings_key(app, key),
         Tab::Guitarix => handle_guitarix_key(app, key),
+    }
+}
+
+fn switch_tab(app: &mut App, direction: i8) {
+    app.active_tab = match (app.active_tab, direction.signum()) {
+        (Tab::Audio, 1) => Tab::Library,
+        (Tab::Library, 1) => Tab::Recordings,
+        (Tab::Recordings, 1) => Tab::Guitarix,
+        (Tab::Guitarix, 1) => Tab::Audio,
+        (Tab::Audio, -1) => Tab::Guitarix,
+        (Tab::Guitarix, -1) => Tab::Recordings,
+        (Tab::Recordings, -1) => Tab::Library,
+        (Tab::Library, -1) => Tab::Audio,
+        _ => app.active_tab,
+    };
+    if app.active_tab != Tab::Audio {
+        app.stop_meter();
     }
 }
 
@@ -878,7 +894,7 @@ fn handle_guitarix_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Up | KeyCode::Char('k') => {
             if app.guitarix.focus == 0 {
                 app.guitarix.bank_selected = app.guitarix.bank_selected.saturating_sub(1);
-                spawn_guitarix_refresh(app, app.selected_bank());
+                request_guitarix_refresh(app, app.selected_bank());
             } else {
                 app.guitarix.preset_selected = app.guitarix.preset_selected.saturating_sub(1);
             }
@@ -887,15 +903,14 @@ fn handle_guitarix_key(app: &mut App, key: KeyEvent) -> bool {
             if app.guitarix.focus == 0 {
                 if app.guitarix.bank_selected + 1 < app.guitarix.banks.len() {
                     app.guitarix.bank_selected += 1;
-                    spawn_guitarix_refresh(app, app.selected_bank());
+                    request_guitarix_refresh(app, app.selected_bank());
                 }
             } else if app.guitarix.preset_selected + 1 < app.guitarix.presets.len() {
                 app.guitarix.preset_selected += 1;
             }
         }
         KeyCode::Char('r') => {
-            app.guitarix.loading = true;
-            spawn_guitarix_refresh(app, app.selected_bank());
+            request_guitarix_refresh(app, app.selected_bank());
         }
         KeyCode::Enter | KeyCode::Char('s') => {
             let bank = app.selected_bank();
@@ -1136,25 +1151,35 @@ fn apply_event(app: &mut App, event: AppEvent) {
             app.audio.loading = true;
             spawn_audio_refresh(app);
         }
-        AppEvent::Guitarix(result) => {
-            app.guitarix.loading = false;
-            match result {
-                Ok(snapshot) => {
-                    app.guitarix.err.clear();
-                    app.guitarix.banks = snapshot.banks;
+        AppEvent::Guitarix(result) => match result {
+            Ok(snapshot) => {
+                app.guitarix.err.clear();
+                app.guitarix.banks = snapshot.banks;
+                app.guitarix.bank_selected = app
+                    .guitarix
+                    .bank_selected
+                    .min(app.guitarix.banks.len().saturating_sub(1));
+                let selected_bank = app.selected_bank();
+                if app.guitarix.loading_bank.is_empty()
+                    || snapshot.bank == selected_bank
+                    || selected_bank.is_empty()
+                {
                     app.guitarix.presets = snapshot.presets;
-                    app.guitarix.bank_selected = app
-                        .guitarix
-                        .bank_selected
-                        .min(app.guitarix.banks.len().saturating_sub(1));
+                    app.guitarix.presets_bank = snapshot.bank;
+                    app.guitarix.loading = false;
+                    app.guitarix.loading_bank.clear();
                     app.guitarix.preset_selected = app
                         .guitarix
                         .preset_selected
                         .min(app.guitarix.presets.len().saturating_sub(1));
                 }
-                Err(err) => app.guitarix.err = err,
             }
-        }
+            Err(err) => {
+                app.guitarix.loading = false;
+                app.guitarix.loading_bank.clear();
+                app.guitarix.err = err;
+            }
+        },
         AppEvent::Preset {
             bank,
             preset,
@@ -1183,6 +1208,9 @@ fn apply_event(app: &mut App, event: AppEvent) {
                 Err(err) => app.add_log(format!("delete bank failed: {}", err)),
             }
             app.guitarix.loading = true;
+            app.guitarix.loading_bank.clear();
+            app.guitarix.presets.clear();
+            app.guitarix.presets_bank.clear();
             spawn_guitarix_refresh(app, String::new());
         }
         AppEvent::Download(event) => apply_download_event(app, event),
@@ -1368,11 +1396,6 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Span::styled("READY", success_style())
     };
-    let query = if app.query.is_empty() {
-        "all guitarix"
-    } else {
-        &app.query
-    };
     let tabs = vec![
         tab_span(app, Tab::Audio, "Audio"),
         Span::raw(" "),
@@ -1389,26 +1412,45 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("Guitarix rig control", muted_style()),
         ]),
         Line::from(tabs),
-        Line::from(vec![
-            state,
-            Span::raw("  "),
-            Span::styled(query.to_string(), accent_style()),
-            Span::raw("  "),
-            Span::styled(format!("page {}", app.page), badge_style()),
-            Span::raw(" "),
-            Span::styled(format!("order {}", app.order), badge_style()),
-            Span::raw(" "),
-            Span::styled(format!("{} files", app.items.len()), badge_style()),
-        ]),
-        Line::from(Span::styled(
-            truncate(
-                &app.dest.display().to_string(),
-                area.width.saturating_sub(4) as usize,
-            ),
-            muted_style(),
-        )),
+        header_status_line(app, state),
+        header_path_line(app, area.width),
     ];
     frame.render_widget(Paragraph::new(lines).block(panel_block("", false)), area);
+}
+
+fn header_status_line(app: &App, state: Span<'static>) -> Line<'static> {
+    if app.active_tab != Tab::Library {
+        return Line::from("");
+    }
+    let query = if app.query.is_empty() {
+        "all guitarix"
+    } else {
+        &app.query
+    };
+    Line::from(vec![
+        state,
+        Span::raw("  "),
+        Span::styled(query.to_string(), accent_style()),
+        Span::raw("  "),
+        Span::styled(format!("page {}", app.page), badge_style()),
+        Span::raw(" "),
+        Span::styled(format!("order {}", app.order), badge_style()),
+        Span::raw(" "),
+        Span::styled(format!("{} files", app.items.len()), badge_style()),
+    ])
+}
+
+fn header_path_line(app: &App, width: u16) -> Line<'static> {
+    if app.active_tab != Tab::Library {
+        return Line::from("");
+    }
+    Line::from(Span::styled(
+        truncate(
+            &app.dest.display().to_string(),
+            width.saturating_sub(4) as usize,
+        ),
+        muted_style(),
+    ))
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -2092,16 +2134,7 @@ fn render_guitarix(frame: &mut Frame, app: &App, area: Rect) {
             app.guitarix.loading,
             &app.guitarix.err,
         );
-        render_string_list(
-            frame,
-            "Presets",
-            &app.guitarix.presets,
-            app.guitarix.preset_selected,
-            cols[1],
-            app.guitarix.focus == 1,
-            app.guitarix.loading,
-            &app.guitarix.err,
-        );
+        render_guitarix_presets(frame, cols[1], app.guitarix.focus == 1, app);
         render_guitarix_detail(frame, app, rows[1]);
     } else {
         let rows = Layout::default()
@@ -2122,18 +2155,43 @@ fn render_guitarix(frame: &mut Frame, app: &App, area: Rect) {
             app.guitarix.loading,
             &app.guitarix.err,
         );
-        render_string_list(
-            frame,
-            "Presets",
-            &app.guitarix.presets,
-            app.guitarix.preset_selected,
-            rows[1],
-            app.guitarix.focus == 1,
-            app.guitarix.loading,
-            &app.guitarix.err,
-        );
+        render_guitarix_presets(frame, rows[1], app.guitarix.focus == 1, app);
         render_guitarix_detail(frame, app, rows[2]);
     }
+}
+
+fn render_guitarix_presets(frame: &mut Frame, area: Rect, focused: bool, app: &App) {
+    if guitarix_presets_loading(app) {
+        let lines = vec![
+            Line::from(Span::styled(" Loading the presets ", active_badge_style())),
+            Line::from(Span::styled(
+                truncate(&app.selected_bank(), area.width.saturating_sub(2) as usize),
+                muted_style(),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines).block(panel_block("Presets", focused)),
+            area,
+        );
+        return;
+    }
+    render_string_list(
+        frame,
+        "Presets",
+        &app.guitarix.presets,
+        app.guitarix.preset_selected,
+        area,
+        focused,
+        app.guitarix.loading,
+        &app.guitarix.err,
+    );
+}
+
+fn guitarix_presets_loading(app: &App) -> bool {
+    let selected_bank = app.selected_bank();
+    (app.guitarix.loading
+        && (app.guitarix.loading_bank.is_empty() || app.guitarix.loading_bank == selected_bank))
+        || (!selected_bank.is_empty() && app.guitarix.presets_bank != selected_bank)
 }
 
 fn render_string_list(
@@ -2332,6 +2390,15 @@ fn spawn_guitarix_refresh(app: &App, preferred_bank: String) {
         let result = guitarix_snapshot(&preferred_bank).map_err(|err| err.to_string());
         let _ = tx.send(AppEvent::Guitarix(result));
     });
+}
+
+fn request_guitarix_refresh(app: &mut App, bank: String) {
+    app.guitarix.loading = true;
+    app.guitarix.loading_bank = bank.clone();
+    app.guitarix.presets.clear();
+    app.guitarix.presets_bank.clear();
+    app.guitarix.preset_selected = 0;
+    spawn_guitarix_refresh(app, bank);
 }
 
 fn spawn_set_preset(app: &App, bank: String, preset: String) {
@@ -3139,7 +3206,11 @@ fn guitarix_snapshot(preferred_bank: &str) -> Result<GuitarixSnapshot> {
         preferred_bank.to_string()
     };
     let presets = guitarix_presets(&bank)?;
-    Ok(GuitarixSnapshot { banks, presets })
+    Ok(GuitarixSnapshot {
+        bank,
+        banks,
+        presets,
+    })
 }
 
 fn guitarix_banks() -> Result<Vec<String>> {
@@ -3632,10 +3703,10 @@ fn label_line(label: &str, value: &str, width: usize) -> Line<'static> {
 
 fn help_line(app: &App) -> String {
     match app.active_tab {
-        Tab::Audio => "tab view  h/left connections  l/right visualizer  up/down select  enter picker  space toggle target  R record  r refresh  q quit  ? hide".to_string(),
-        Tab::Recordings => "tab view  up/down select  enter/p play  s stop  e rename  x delete  r refresh  q quit  ? hide".to_string(),
-        Tab::Guitarix => "tab view  h banks  l presets  up/down select  enter/s switch preset  x delete bank  r refresh  q quit  ? hide".to_string(),
-        Tab::Library => "tab view  up/down select  enter/d download  a all visible  / search  n/p page  o order  c crawl  r refresh  q quit  ? hide".to_string(),
+        Tab::Audio => "tab/shift-tab view  h/left connections  l/right visualizer  up/down select  enter picker  space toggle target  R record  r refresh  q quit  ? hide".to_string(),
+        Tab::Recordings => "tab/shift-tab view  up/down select  enter/p play  s stop  e rename  x delete  r refresh  q quit  ? hide".to_string(),
+        Tab::Guitarix => "tab/shift-tab view  h banks  l presets  up/down select  enter/s switch preset  x delete bank  r refresh  q quit  ? hide".to_string(),
+        Tab::Library => "tab/shift-tab view  up/down select  enter/d download  a all visible  / search  n/p page  o order  c crawl  r refresh  q quit  ? hide".to_string(),
     }
 }
 
