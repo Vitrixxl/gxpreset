@@ -96,3 +96,7 @@ Pedal groups are saved in:
 ```sh
 ${XDG_CONFIG_HOME:-$HOME/.config}/gxpreset/pedals.json
 ```
+
+Each pedal group also gets a real generated Guitarix bank named `gxpreset - <group>`.
+The CLI writes that bank into the Guitarix bank directory and reloads Guitarix's bank
+list, so switching `,` / `;` selects normal Guitarix presets inside that generated bank.

@@ -40,6 +40,7 @@ const MAX_VOLUME_HISTORY: usize = 512;
 const VOLUME_DB_GATE: f64 = -38.0;
 const VOLUME_DB_CEILING: f64 = 0.0;
 const VISUALIZER_MAX_HEIGHT_RATIO: f64 = 0.72;
+const PEDAL_BANK_PREFIX: &str = "gxpreset - ";
 
 #[derive(Clone, Debug, Default)]
 struct Artifact {
@@ -159,8 +160,20 @@ struct PedalPreset {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PedalGroup {
     name: String,
+    #[serde(default)]
+    guitarix_bank: String,
     presets: Vec<PedalPreset>,
     current: usize,
+    #[serde(default)]
+    sync_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct PedalBankSync {
+    bank: String,
+    path: PathBuf,
+    count: usize,
+    removed: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1043,9 +1056,11 @@ fn finish_new_pedal_group(app: &mut App) {
         return;
     }
     app.pedals.groups.push(PedalGroup {
+        guitarix_bank: generated_pedal_bank_name(&name),
         name,
         presets: Vec::new(),
         current: 0,
+        sync_key: String::new(),
     });
     app.pedals.selected = app.pedals.groups.len().saturating_sub(1);
     if let Err(err) = save_pedals_state(&app.pedals) {
@@ -1078,9 +1093,11 @@ fn finish_rename_pedal_group(app: &mut App) {
     }
     if let Some(group) = app.pedals.groups.get_mut(app.pedals.selected) {
         group.name = name;
+        group.sync_key.clear();
         if let Err(err) = save_pedals_state(&app.pedals) {
             app.add_log(format!("pedal save failed: {}", err));
         }
+        sync_selected_pedal_group(app);
     }
 }
 
@@ -1142,20 +1159,24 @@ fn add_picker_preset_to_group(app: &mut App) {
     if let Some(group) = app.pedals.groups.get_mut(app.pedals.selected) {
         group.presets.push(PedalPreset { bank, preset });
         group.current = group.presets.len().saturating_sub(1);
+        group.sync_key.clear();
         app.pedals.picking_preset = false;
         if let Err(err) = save_pedals_state(&app.pedals) {
             app.add_log(format!("pedal save failed: {}", err));
         }
+        sync_selected_pedal_group(app);
     }
 }
 
 fn delete_selected_pedal_item(app: &mut App) {
+    let mut removed_group_bank = String::new();
     match app.pedals.focus {
         PedalFocus::Groups => {
             if app.pedals.groups.is_empty() {
                 return;
             }
             let removed = app.pedals.groups.remove(app.pedals.selected);
+            removed_group_bank = removed.guitarix_bank.clone();
             app.pedals.selected = app
                 .pedals
                 .selected
@@ -1171,6 +1192,7 @@ fn delete_selected_pedal_item(app: &mut App) {
                     .presets
                     .remove(group.current.min(group.presets.len() - 1));
                 group.current = group.current.min(group.presets.len().saturating_sub(1));
+                group.sync_key.clear();
                 app.add_log(format!(
                     "deleted pedal preset: {} / {}",
                     removed.bank, removed.preset
@@ -1180,6 +1202,18 @@ fn delete_selected_pedal_item(app: &mut App) {
     }
     if let Err(err) = save_pedals_state(&app.pedals) {
         app.add_log(format!("pedal save failed: {}", err));
+    }
+    if !removed_group_bank.is_empty() {
+        match remove_generated_pedal_bank(&removed_group_bank, &app.dest) {
+            Ok(Some(path)) => {
+                app.add_log(format!("removed pedal bank: {}", path.display()));
+                spawn_guitarix_bank_reparse(app, String::new());
+            }
+            Ok(None) => {}
+            Err(err) => app.add_log(format!("remove pedal bank failed: {}", err)),
+        }
+    } else if app.pedals.focus == PedalFocus::Presets {
+        sync_selected_pedal_group(app);
     }
 }
 
@@ -1226,20 +1260,116 @@ fn activate_pedal_preset(app: &mut App, group_index: usize, preset_index: usize)
         app.add_log(format!("pedal load skipped: {} is empty", group_name));
         return;
     }
-    let (group_name, preset) = {
+    if !ensure_pedal_group_materialized(app, group_index) {
+        return;
+    }
+    let (group_name, bank, source, generated_preset) = {
         let group = &mut app.pedals.groups[group_index];
         let preset_index = preset_index.min(group.presets.len().saturating_sub(1));
         group.current = preset_index;
-        (group.name.clone(), group.presets[preset_index].clone())
+        let source = group.presets[preset_index].clone();
+        (
+            group.name.clone(),
+            pedal_group_bank_name(group),
+            source.clone(),
+            generated_pedal_preset_name(preset_index, &source),
+        )
     };
     if let Err(err) = save_pedals_state(&app.pedals) {
         app.add_log(format!("pedal save failed: {}", err));
     }
     app.add_log(format!(
         "pedal {}: {} / {}",
-        group_name, preset.bank, preset.preset
+        group_name, source.bank, source.preset
     ));
-    spawn_set_preset(app, preset.bank, preset.preset);
+    spawn_set_preset(app, bank, generated_preset);
+}
+
+fn ensure_pedal_group_materialized(app: &mut App, group_index: usize) -> bool {
+    let needs_sync = app
+        .pedals
+        .groups
+        .get(group_index)
+        .is_some_and(|group| pedal_group_needs_sync(group, &app.dest));
+    let mut reloaded = false;
+    if needs_sync {
+        match sync_pedal_group_by_index(app, group_index) {
+            Ok(sync) => {
+                log_pedal_sync_result(app, &sync);
+                if sync.count > 0 {
+                    match guitarix_bank_check_reparse() {
+                        Ok(_) => reloaded = true,
+                        Err(err) => app.add_log(format!("guitarix bank reload failed: {}", err)),
+                    }
+                }
+            }
+            Err(err) => {
+                app.add_log(format!("pedal bank sync failed: {}", err));
+                return false;
+            }
+        }
+    }
+    let bank = app
+        .pedals
+        .groups
+        .get(group_index)
+        .map(pedal_group_bank_name)
+        .unwrap_or_default();
+    if !bank.is_empty() && reloaded {
+        spawn_guitarix_refresh(app, bank);
+    } else if !bank.is_empty() && !app.guitarix.banks.iter().any(|known| known == &bank) {
+        match guitarix_bank_check_reparse() {
+            Ok(_) => spawn_guitarix_refresh(app, bank),
+            Err(err) => app.add_log(format!("guitarix bank reload failed: {}", err)),
+        }
+    }
+    true
+}
+
+fn sync_selected_pedal_group(app: &mut App) {
+    if app.pedals.groups.is_empty() {
+        return;
+    }
+    let group_index = app.pedals.selected.min(app.pedals.groups.len() - 1);
+    match sync_pedal_group_by_index(app, group_index) {
+        Ok(sync) => {
+            log_pedal_sync_result(app, &sync);
+            if sync.count > 0 || sync.removed {
+                let preferred = if sync.count > 0 {
+                    sync.bank.clone()
+                } else {
+                    String::new()
+                };
+                spawn_guitarix_bank_reparse(app, preferred);
+            }
+        }
+        Err(err) => app.add_log(format!("pedal bank sync failed: {}", err)),
+    }
+}
+
+fn sync_pedal_group_by_index(app: &mut App, group_index: usize) -> Result<PedalBankSync> {
+    let dir = app.dest.clone();
+    let sync = {
+        let group = app
+            .pedals
+            .groups
+            .get_mut(group_index)
+            .ok_or_else(|| anyhow::anyhow!("no pedal group selected"))?;
+        materialize_pedal_group_bank(group, &dir)?
+    };
+    save_pedals_state(&app.pedals)?;
+    Ok(sync)
+}
+
+fn log_pedal_sync_result(app: &mut App, sync: &PedalBankSync) {
+    if sync.count > 0 {
+        app.add_log(format!(
+            "pedal bank ready: {} ({} presets)",
+            sync.bank, sync.count
+        ));
+    } else if sync.removed {
+        app.add_log(format!("pedal bank removed: {}", sync.path.display()));
+    }
 }
 
 fn handle_audio_picker_key(app: &mut App, key: KeyEvent) -> bool {
@@ -2605,6 +2735,11 @@ fn render_pedal_detail(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     if let Some(group) = app.pedals.groups.get(app.pedals.selected) {
         lines.push(label_line("Group", &group.name, area.width as usize));
+        lines.push(label_line(
+            "Guitarix bank",
+            &pedal_group_bank_name(group),
+            area.width as usize,
+        ));
         if let Some(preset) = group
             .presets
             .get(group.current.min(group.presets.len().saturating_sub(1)))
@@ -3103,6 +3238,15 @@ fn spawn_recordings_refresh(app: &App) {
 fn spawn_guitarix_refresh(app: &App, preferred_bank: String) {
     let tx = app.tx.clone();
     thread::spawn(move || {
+        let result = guitarix_snapshot(&preferred_bank).map_err(|err| err.to_string());
+        let _ = tx.send(AppEvent::Guitarix(result));
+    });
+}
+
+fn spawn_guitarix_bank_reparse(app: &App, preferred_bank: String) {
+    let tx = app.tx.clone();
+    thread::spawn(move || {
+        let _ = guitarix_bank_check_reparse();
         let result = guitarix_snapshot(&preferred_bank).map_err(|err| err.to_string());
         let _ = tx.send(AppEvent::Guitarix(result));
     });
@@ -3930,6 +4074,252 @@ fn sanitize_group_name(input: &str) -> String {
         .collect()
 }
 
+fn pedal_group_bank_name(group: &PedalGroup) -> String {
+    if group.guitarix_bank.trim().is_empty() {
+        generated_pedal_bank_name(&group.name)
+    } else {
+        group.guitarix_bank.clone()
+    }
+}
+
+fn generated_pedal_bank_name(name: &str) -> String {
+    let label = sanitize_guitarix_label(name, "Pedal Group");
+    format!("{}{}", PEDAL_BANK_PREFIX, label)
+}
+
+fn generated_pedal_preset_name(index: usize, preset: &PedalPreset) -> String {
+    let source = sanitize_guitarix_label(&format!("{} - {}", preset.bank, preset.preset), "Preset");
+    format!("{:02} {}", index + 1, limit_chars(&source, 86))
+}
+
+fn sanitize_guitarix_label(input: &str, fallback: &str) -> String {
+    let out = input
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    if out.is_empty() {
+        fallback.to_string()
+    } else {
+        limit_chars(&out, 96)
+    }
+}
+
+fn limit_chars(input: &str, limit: usize) -> String {
+    input.chars().take(limit).collect()
+}
+
+fn pedal_group_sync_key(group: &PedalGroup) -> String {
+    let mut key = generated_pedal_bank_name(&group.name);
+    key.push('\n');
+    for preset in &group.presets {
+        key.push_str(&preset.bank);
+        key.push('\t');
+        key.push_str(&preset.preset);
+        key.push('\n');
+    }
+    key
+}
+
+fn pedal_group_needs_sync(group: &PedalGroup, dir: &Path) -> bool {
+    if group.presets.is_empty() {
+        return false;
+    }
+    let bank = pedal_group_bank_name(group);
+    group.sync_key != pedal_group_sync_key(group) || !generated_pedal_bank_path(dir, &bank).exists()
+}
+
+fn materialize_pedal_group_bank(group: &mut PedalGroup, dir: &Path) -> Result<PedalBankSync> {
+    fs::create_dir_all(dir)?;
+    let old_bank = group.guitarix_bank.clone();
+    let bank = generated_pedal_bank_name(&group.name);
+    let path = generated_pedal_bank_path(dir, &bank);
+
+    if group.presets.is_empty() {
+        group.guitarix_bank = bank.clone();
+        group.sync_key = pedal_group_sync_key(group);
+        let removed = if !old_bank.is_empty() {
+            remove_generated_pedal_bank(&old_bank, dir)?.is_some()
+        } else {
+            remove_generated_pedal_bank(&bank, dir)?.is_some()
+        };
+        return Ok(PedalBankSync {
+            bank,
+            path,
+            count: 0,
+            removed,
+        });
+    }
+
+    let content = build_pedal_bank_content(group, dir)?;
+    if !old_bank.is_empty() && old_bank != bank {
+        let _ = remove_generated_pedal_bank(&old_bank, dir);
+    }
+
+    let filename = generated_pedal_bank_filename(&bank);
+    fs::write(&path, serde_json::to_string_pretty(&content)? + "\n")?;
+    upsert_guitarix_banklist_entry(dir, &bank, &filename)?;
+    group.guitarix_bank = bank.clone();
+    group.sync_key = pedal_group_sync_key(group);
+
+    Ok(PedalBankSync {
+        bank,
+        path,
+        count: group.presets.len(),
+        removed: false,
+    })
+}
+
+fn build_pedal_bank_content(group: &PedalGroup, dir: &Path) -> Result<Value> {
+    let mut header = None;
+    let mut values = Vec::with_capacity(2 + group.presets.len() * 2);
+    for (index, preset) in group.presets.iter().enumerate() {
+        let source = read_guitarix_preset_data(dir, &preset.bank, &preset.preset)
+            .with_context(|| format!("copy preset {} / {}", preset.bank, preset.preset))?;
+        if header.is_none() {
+            header = Some(source.0);
+        }
+        values.push(Value::String(generated_pedal_preset_name(index, preset)));
+        values.push(source.1);
+    }
+
+    let mut out = Vec::with_capacity(values.len() + 2);
+    out.push(Value::String("gx_head_file_version".to_string()));
+    out.push(header.unwrap_or_else(default_guitarix_file_version));
+    out.extend(values);
+    Ok(Value::Array(out))
+}
+
+fn read_guitarix_preset_data(dir: &Path, bank: &str, preset: &str) -> Result<(Value, Value)> {
+    let path = resolve_guitarix_bank_file(bank, dir)?;
+    let data = fs::read_to_string(&path)
+        .with_context(|| format!("read Guitarix bank {}", path.display()))?;
+    let value: Value = serde_json::from_str(&data)
+        .with_context(|| format!("parse Guitarix bank {}", path.display()))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Guitarix bank is not a JSON array: {}", path.display()))?;
+    let header = items
+        .get(1)
+        .cloned()
+        .unwrap_or_else(default_guitarix_file_version);
+
+    for pair in items.chunks_exact(2) {
+        if pair
+            .first()
+            .and_then(Value::as_str)
+            .is_some_and(|name| name == preset)
+        {
+            return Ok((header, pair[1].clone()));
+        }
+    }
+    Err(anyhow::anyhow!(
+        "preset {:?} not found in bank {:?}",
+        preset,
+        bank
+    ))
+}
+
+fn default_guitarix_file_version() -> Value {
+    json!([1, 2, "0.44.1"])
+}
+
+fn generated_pedal_bank_filename(bank: &str) -> String {
+    format!("{}.gx", clean_filename(bank))
+}
+
+fn generated_pedal_bank_path(dir: &Path, bank: &str) -> PathBuf {
+    dir.join(generated_pedal_bank_filename(bank))
+}
+
+fn is_generated_pedal_bank(bank: &str) -> bool {
+    bank.starts_with(PEDAL_BANK_PREFIX)
+}
+
+fn remove_generated_pedal_bank(bank: &str, dir: &Path) -> Result<Option<PathBuf>> {
+    if bank.trim().is_empty() || !is_generated_pedal_bank(bank) {
+        return Ok(None);
+    }
+    let filename = generated_pedal_bank_filename(bank);
+    let path = generated_pedal_bank_path(dir, bank);
+    let removed_file = match fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err.into()),
+    };
+    let removed_entry = remove_guitarix_banklist_entry(dir, bank, &filename)?;
+    if removed_file || removed_entry {
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+fn upsert_guitarix_banklist_entry(dir: &Path, bank: &str, filename: &str) -> Result<()> {
+    let path = dir.join("banklist.js");
+    let mut entries = read_guitarix_banklist(&path)?;
+    entries.retain(|entry| !banklist_entry_matches(entry, bank, filename));
+    entries.insert(
+        0,
+        json!([bank, filename, 1, 0, [1, 2], unix_timestamp_seconds()]),
+    );
+    write_guitarix_banklist(&path, entries)
+}
+
+fn remove_guitarix_banklist_entry(dir: &Path, bank: &str, filename: &str) -> Result<bool> {
+    let path = dir.join("banklist.js");
+    let mut entries = read_guitarix_banklist(&path)?;
+    let before = entries.len();
+    entries.retain(|entry| !banklist_entry_matches(entry, bank, filename));
+    let removed = entries.len() != before;
+    if removed {
+        write_guitarix_banklist(&path, entries)?;
+    }
+    Ok(removed)
+}
+
+fn read_guitarix_banklist(path: &Path) -> Result<Vec<Value>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = fs::read_to_string(path)?;
+    if data.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: Value = serde_json::from_str(&data)
+        .with_context(|| format!("parse Guitarix banklist {}", path.display()))?;
+    Ok(value.as_array().cloned().unwrap_or_default())
+}
+
+fn write_guitarix_banklist(path: &Path, entries: Vec<Value>) -> Result<()> {
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&Value::Array(entries))? + "\n",
+    )?;
+    Ok(())
+}
+
+fn banklist_entry_matches(entry: &Value, bank: &str, filename: &str) -> bool {
+    let Some(items) = entry.as_array() else {
+        return false;
+    };
+    let entry_bank = items.first().and_then(Value::as_str).unwrap_or("");
+    let entry_file = items.get(1).and_then(Value::as_str).unwrap_or("");
+    entry_bank == bank
+        || entry_file == filename
+        || normalized_key(entry_bank) == normalized_key(bank)
+        || normalized_key(entry_file) == normalized_key(filename)
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn guitarix_snapshot(preferred_bank: &str) -> Result<GuitarixSnapshot> {
     let banks = guitarix_banks()?;
     if banks.is_empty() {
@@ -3963,6 +4353,11 @@ fn guitarix_presets(bank: &str) -> Result<Vec<String>> {
 
 fn guitarix_set_preset(bank: &str, preset: &str) -> Result<()> {
     guitarix_notify("setpreset", json!([bank, preset]))
+}
+
+fn guitarix_bank_check_reparse() -> Result<bool> {
+    let raw = guitarix_call("bank_check_reparse", json!([]))?;
+    Ok(raw.as_bool().unwrap_or(false))
 }
 
 fn guitarix_call(method: &str, params: Value) -> Result<Value> {
@@ -4642,4 +5037,71 @@ fn extract_json_object(data: &str) -> Option<String> {
     let start = data.find('{')?;
     let end = data.rfind('}')?;
     (end >= start).then(|| data[start..=end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("gxpreset-{}-{}", name, unix_timestamp_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn materializes_pedal_group_as_guitarix_bank() {
+        let dir = test_dir("pedal-bank");
+        fs::write(
+            dir.join("Source.gx"),
+            r#"[
+  "gx_head_file_version", [1, 2, "0.44.1"],
+  "Clean", {"engine": {"amp.on_off": 0}},
+  "Lead", {"engine": {"amp.on_off": 1}}
+]"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("banklist.js"),
+            r#"[["Source", "Source.gx", 1, 0, [1, 2], 1]]"#,
+        )
+        .unwrap();
+
+        let mut group = PedalGroup {
+            name: "Live".to_string(),
+            guitarix_bank: String::new(),
+            presets: vec![
+                PedalPreset {
+                    bank: "Source".to_string(),
+                    preset: "Clean".to_string(),
+                },
+                PedalPreset {
+                    bank: "Source".to_string(),
+                    preset: "Lead".to_string(),
+                },
+            ],
+            current: 0,
+            sync_key: String::new(),
+        };
+
+        let sync = materialize_pedal_group_bank(&mut group, &dir).unwrap();
+        assert_eq!(sync.bank, "gxpreset - Live");
+        assert_eq!(sync.count, 2);
+        assert_eq!(group.sync_key, pedal_group_sync_key(&group));
+
+        let generated: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("gxpreset - Live.gx")).unwrap())
+                .unwrap();
+        let items = generated.as_array().unwrap();
+        assert_eq!(items[2].as_str(), Some("01 Source - Clean"));
+        assert_eq!(items[4].as_str(), Some("02 Source - Lead"));
+
+        let banklist: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("banklist.js")).unwrap()).unwrap();
+        let first = banklist.as_array().unwrap()[0].as_array().unwrap();
+        assert_eq!(first[0].as_str(), Some("gxpreset - Live"));
+        assert_eq!(first[1].as_str(), Some("gxpreset - Live.gx"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
 }
