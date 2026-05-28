@@ -150,6 +150,64 @@ struct AppConfig {
     last_meter_source: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PedalPreset {
+    bank: String,
+    preset: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PedalGroup {
+    name: String,
+    presets: Vec<PedalPreset>,
+    current: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PedalsFile {
+    groups: Vec<PedalGroup>,
+    selected: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PedalsState {
+    groups: Vec<PedalGroup>,
+    selected: usize,
+    focus: PedalFocus,
+    picking_preset: bool,
+    picker_focus: usize,
+    picker_bank_selected: usize,
+    picker_preset_selected: usize,
+    picker_bank: String,
+    picker_presets: Vec<String>,
+    picker_loading: bool,
+    picker_err: String,
+}
+
+impl Default for PedalsState {
+    fn default() -> Self {
+        Self {
+            groups: Vec::new(),
+            selected: 0,
+            focus: PedalFocus::Groups,
+            picking_preset: false,
+            picker_focus: 0,
+            picker_bank_selected: 0,
+            picker_preset_selected: 0,
+            picker_bank: String::new(),
+            picker_presets: Vec::new(),
+            picker_loading: false,
+            picker_err: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PedalFocus {
+    Groups,
+    Presets,
+}
+
 #[derive(Clone, Debug)]
 struct Args {
     dest: PathBuf,
@@ -167,6 +225,7 @@ struct Args {
 enum Tab {
     Library,
     Audio,
+    Pedals,
     Recordings,
     Guitarix,
 }
@@ -176,6 +235,8 @@ enum Mode {
     Browse,
     Search,
     RenameRecording,
+    NewPedalGroup,
+    RenamePedalGroup,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -218,6 +279,7 @@ struct App {
     download_seen: Arc<Mutex<HashSet<String>>>,
     stats: DownloaderStats,
     audio: AudioState,
+    pedals: PedalsState,
     recordings: RecordingsState,
     guitarix: GuitarixState,
     meter: Option<MeterControl>,
@@ -273,6 +335,10 @@ enum AppEvent {
         err: String,
     },
     Recordings(Result<Vec<RecordingItem>, String>),
+    PedalPickerPresets {
+        bank: String,
+        result: Result<Vec<String>, String>,
+    },
 }
 
 #[derive(Debug)]
@@ -363,6 +429,7 @@ fn run_tui(client: Client, args: Args, deps: DependencyStatus) -> Result<()> {
 
     let (tx, rx) = unbounded();
     let config = load_app_config();
+    let pedals = load_pedals_file();
     let mut app = App {
         client,
         tx: tx.clone(),
@@ -388,6 +455,7 @@ fn run_tui(client: Client, args: Args, deps: DependencyStatus) -> Result<()> {
         download_seen: Arc::new(Mutex::new(HashSet::new())),
         stats: DownloaderStats::default(),
         audio: AudioState::default(),
+        pedals,
         recordings: RecordingsState {
             loading: true,
             ..RecordingsState::default()
@@ -470,6 +538,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.mode == Mode::RenameRecording {
         return handle_rename_recording_key(app, key);
     }
+    if app.mode == Mode::NewPedalGroup || app.mode == Mode::RenamePedalGroup {
+        return handle_pedal_group_input_key(app, key);
+    }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.quitting = true;
@@ -491,12 +562,21 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             switch_tab(app, -1);
             return true;
         }
+        KeyCode::Char(',') | KeyCode::Char('[') => {
+            switch_active_pedal(app, -1);
+            return true;
+        }
+        KeyCode::Char(';') | KeyCode::Char(']') => {
+            switch_active_pedal(app, 1);
+            return true;
+        }
         _ => {}
     }
 
     match app.active_tab {
         Tab::Library => handle_library_key(app, key),
         Tab::Audio => handle_audio_key(app, key),
+        Tab::Pedals => handle_pedals_key(app, key),
         Tab::Recordings => handle_recordings_key(app, key),
         Tab::Guitarix => handle_guitarix_key(app, key),
     }
@@ -504,14 +584,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
 fn switch_tab(app: &mut App, direction: i8) {
     app.active_tab = match (app.active_tab, direction.signum()) {
-        (Tab::Audio, 1) => Tab::Library,
+        (Tab::Audio, 1) => Tab::Pedals,
+        (Tab::Pedals, 1) => Tab::Library,
         (Tab::Library, 1) => Tab::Recordings,
         (Tab::Recordings, 1) => Tab::Guitarix,
         (Tab::Guitarix, 1) => Tab::Audio,
         (Tab::Audio, -1) => Tab::Guitarix,
         (Tab::Guitarix, -1) => Tab::Recordings,
         (Tab::Recordings, -1) => Tab::Library,
-        (Tab::Library, -1) => Tab::Audio,
+        (Tab::Library, -1) => Tab::Pedals,
+        (Tab::Pedals, -1) => Tab::Audio,
         _ => app.active_tab,
     };
     if app.active_tab != Tab::Audio {
@@ -675,6 +757,132 @@ fn handle_recordings_key(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
+fn handle_pedals_key(app: &mut App, key: KeyEvent) -> bool {
+    if app.pedals.picking_preset {
+        return handle_pedal_picker_key(app, key);
+    }
+    match key.code {
+        KeyCode::Left | KeyCode::Char('h') => app.pedals.focus = PedalFocus::Groups,
+        KeyCode::Right | KeyCode::Char('l') => app.pedals.focus = PedalFocus::Presets,
+        KeyCode::Up | KeyCode::Char('k') => match app.pedals.focus {
+            PedalFocus::Groups => app.pedals.selected = app.pedals.selected.saturating_sub(1),
+            PedalFocus::Presets => {
+                if let Some(group) = app.pedals.groups.get_mut(app.pedals.selected) {
+                    group.current = group.current.saturating_sub(1);
+                }
+            }
+        },
+        KeyCode::Down | KeyCode::Char('j') => match app.pedals.focus {
+            PedalFocus::Groups => {
+                if app.pedals.selected + 1 < app.pedals.groups.len() {
+                    app.pedals.selected += 1;
+                }
+            }
+            PedalFocus::Presets => {
+                if let Some(group) = app.pedals.groups.get_mut(app.pedals.selected) {
+                    if group.current + 1 < group.presets.len() {
+                        group.current += 1;
+                    }
+                }
+            }
+        },
+        KeyCode::Home => match app.pedals.focus {
+            PedalFocus::Groups => app.pedals.selected = 0,
+            PedalFocus::Presets => {
+                if let Some(group) = app.pedals.groups.get_mut(app.pedals.selected) {
+                    group.current = 0;
+                }
+            }
+        },
+        KeyCode::End => match app.pedals.focus {
+            PedalFocus::Groups => app.pedals.selected = app.pedals.groups.len().saturating_sub(1),
+            PedalFocus::Presets => {
+                if let Some(group) = app.pedals.groups.get_mut(app.pedals.selected) {
+                    group.current = group.presets.len().saturating_sub(1);
+                }
+            }
+        },
+        KeyCode::Char('n') => {
+            app.input.clear();
+            app.mode = Mode::NewPedalGroup;
+        }
+        KeyCode::Char('e') => start_rename_pedal_group(app),
+        KeyCode::Char('a') => start_pedal_picker(app),
+        KeyCode::Enter | KeyCode::Char('s') => activate_current_pedal(app),
+        KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+            delete_selected_pedal_item(app)
+        }
+        _ => return false,
+    }
+    persist_pedals(app);
+    true
+}
+
+fn handle_pedal_picker_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => app.pedals.picking_preset = false,
+        KeyCode::Left | KeyCode::Char('h') => app.pedals.picker_focus = 0,
+        KeyCode::Right | KeyCode::Char('l') => app.pedals.picker_focus = 1,
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.pedals.picker_focus == 0 {
+                let index = app.pedals.picker_bank_selected.saturating_sub(1);
+                select_pedal_picker_bank(app, index);
+            } else {
+                app.pedals.picker_preset_selected =
+                    app.pedals.picker_preset_selected.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.pedals.picker_focus == 0 {
+                if app.pedals.picker_bank_selected + 1 < app.guitarix.banks.len() {
+                    select_pedal_picker_bank(app, app.pedals.picker_bank_selected + 1);
+                }
+            } else if app.pedals.picker_preset_selected + 1 < app.pedals.picker_presets.len() {
+                app.pedals.picker_preset_selected += 1;
+            }
+        }
+        KeyCode::Home => {
+            if app.pedals.picker_focus == 0 {
+                select_pedal_picker_bank(app, 0);
+            } else {
+                app.pedals.picker_preset_selected = 0;
+            }
+        }
+        KeyCode::End => {
+            if app.pedals.picker_focus == 0 {
+                select_pedal_picker_bank(app, app.guitarix.banks.len().saturating_sub(1));
+            } else {
+                app.pedals.picker_preset_selected =
+                    app.pedals.picker_presets.len().saturating_sub(1);
+            }
+        }
+        KeyCode::Enter | KeyCode::Char('a') => add_picker_preset_to_group(app),
+        _ => return false,
+    }
+    true
+}
+
+fn handle_pedal_group_input_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => match app.mode {
+            Mode::NewPedalGroup => finish_new_pedal_group(app),
+            Mode::RenamePedalGroup => finish_rename_pedal_group(app),
+            _ => {}
+        },
+        KeyCode::Esc => {
+            app.input.clear();
+            app.mode = Mode::Browse;
+        }
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.input.clear(),
+        KeyCode::Char(c) => app.input.push(c),
+        _ => return false,
+    }
+    true
+}
+
 fn handle_rename_recording_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Enter => finish_rename_recording(app),
@@ -824,6 +1032,214 @@ fn delete_selected_recording(app: &mut App) {
         }
         Err(err) => app.add_log(format!("delete failed: {}", err)),
     }
+}
+
+fn finish_new_pedal_group(app: &mut App) {
+    let name = sanitize_group_name(&app.input);
+    app.input.clear();
+    app.mode = Mode::Browse;
+    if name.is_empty() {
+        app.add_log("pedal group skipped: empty name");
+        return;
+    }
+    app.pedals.groups.push(PedalGroup {
+        name,
+        presets: Vec::new(),
+        current: 0,
+    });
+    app.pedals.selected = app.pedals.groups.len().saturating_sub(1);
+    if let Err(err) = save_pedals_state(&app.pedals) {
+        app.add_log(format!("pedal save failed: {}", err));
+    }
+}
+
+fn persist_pedals(app: &mut App) {
+    if let Err(err) = save_pedals_state(&app.pedals) {
+        app.add_log(format!("pedal save failed: {}", err));
+    }
+}
+
+fn start_rename_pedal_group(app: &mut App) {
+    if let Some(group) = app.pedals.groups.get(app.pedals.selected) {
+        app.input = group.name.clone();
+        app.mode = Mode::RenamePedalGroup;
+    } else {
+        app.add_log("rename pedal group failed: no group selected");
+    }
+}
+
+fn finish_rename_pedal_group(app: &mut App) {
+    let name = sanitize_group_name(&app.input);
+    app.input.clear();
+    app.mode = Mode::Browse;
+    if name.is_empty() {
+        app.add_log("rename pedal group skipped: empty name");
+        return;
+    }
+    if let Some(group) = app.pedals.groups.get_mut(app.pedals.selected) {
+        group.name = name;
+        if let Err(err) = save_pedals_state(&app.pedals) {
+            app.add_log(format!("pedal save failed: {}", err));
+        }
+    }
+}
+
+fn start_pedal_picker(app: &mut App) {
+    if app.pedals.groups.is_empty() {
+        app.add_log("add pedal preset failed: create a group first");
+        return;
+    }
+    app.pedals.picking_preset = true;
+    app.pedals.picker_focus = 0;
+    app.pedals.picker_bank_selected = app
+        .pedals
+        .picker_bank_selected
+        .min(app.guitarix.banks.len().saturating_sub(1));
+    if app.guitarix.banks.is_empty() {
+        app.pedals.picker_bank.clear();
+        app.pedals.picker_presets.clear();
+        app.pedals.picker_loading = true;
+        spawn_guitarix_refresh(app, String::new());
+    } else {
+        select_pedal_picker_bank(app, app.pedals.picker_bank_selected);
+    }
+}
+
+fn select_pedal_picker_bank(app: &mut App, index: usize) {
+    if app.guitarix.banks.is_empty() {
+        app.pedals.picker_bank.clear();
+        app.pedals.picker_presets.clear();
+        app.pedals.picker_loading = false;
+        return;
+    }
+    let index = index.min(app.guitarix.banks.len().saturating_sub(1));
+    let bank = app.guitarix.banks[index].clone();
+    if app.pedals.picker_bank == bank && !app.pedals.picker_presets.is_empty() {
+        app.pedals.picker_bank_selected = index;
+        return;
+    }
+    app.pedals.picker_bank_selected = index;
+    app.pedals.picker_bank = bank.clone();
+    app.pedals.picker_preset_selected = 0;
+    app.pedals.picker_presets.clear();
+    app.pedals.picker_err.clear();
+    app.pedals.picker_loading = true;
+    spawn_pedal_picker_presets(app, bank);
+}
+
+fn add_picker_preset_to_group(app: &mut App) {
+    let bank = app.pedals.picker_bank.clone();
+    let preset = app
+        .pedals
+        .picker_presets
+        .get(app.pedals.picker_preset_selected)
+        .cloned()
+        .unwrap_or_default();
+    if bank.is_empty() || preset.is_empty() {
+        app.add_log("add pedal preset failed: no preset selected");
+        return;
+    }
+    if let Some(group) = app.pedals.groups.get_mut(app.pedals.selected) {
+        group.presets.push(PedalPreset { bank, preset });
+        group.current = group.presets.len().saturating_sub(1);
+        app.pedals.picking_preset = false;
+        if let Err(err) = save_pedals_state(&app.pedals) {
+            app.add_log(format!("pedal save failed: {}", err));
+        }
+    }
+}
+
+fn delete_selected_pedal_item(app: &mut App) {
+    match app.pedals.focus {
+        PedalFocus::Groups => {
+            if app.pedals.groups.is_empty() {
+                return;
+            }
+            let removed = app.pedals.groups.remove(app.pedals.selected);
+            app.pedals.selected = app
+                .pedals
+                .selected
+                .min(app.pedals.groups.len().saturating_sub(1));
+            app.add_log(format!("deleted pedal group: {}", removed.name));
+        }
+        PedalFocus::Presets => {
+            if let Some(group) = app.pedals.groups.get_mut(app.pedals.selected) {
+                if group.presets.is_empty() {
+                    return;
+                }
+                let removed = group
+                    .presets
+                    .remove(group.current.min(group.presets.len() - 1));
+                group.current = group.current.min(group.presets.len().saturating_sub(1));
+                app.add_log(format!(
+                    "deleted pedal preset: {} / {}",
+                    removed.bank, removed.preset
+                ));
+            }
+        }
+    }
+    if let Err(err) = save_pedals_state(&app.pedals) {
+        app.add_log(format!("pedal save failed: {}", err));
+    }
+}
+
+fn activate_current_pedal(app: &mut App) {
+    let group_index = app.pedals.selected;
+    let preset_index = app
+        .pedals
+        .groups
+        .get(group_index)
+        .map(|group| group.current)
+        .unwrap_or_default();
+    activate_pedal_preset(app, group_index, preset_index);
+}
+
+fn switch_active_pedal(app: &mut App, direction: isize) {
+    let group_index = app.pedals.selected;
+    let Some(group) = app.pedals.groups.get(group_index) else {
+        app.add_log("pedal switch skipped: no group selected");
+        return;
+    };
+    let len = group.presets.len();
+    if len == 0 {
+        app.add_log(format!("pedal switch skipped: {} is empty", group.name));
+        return;
+    }
+    let current = group.current.min(len - 1);
+    let next = if direction >= 0 {
+        (current + 1) % len
+    } else if current == 0 {
+        len - 1
+    } else {
+        current - 1
+    };
+    activate_pedal_preset(app, group_index, next);
+}
+
+fn activate_pedal_preset(app: &mut App, group_index: usize, preset_index: usize) {
+    if group_index >= app.pedals.groups.len() {
+        app.add_log("pedal load failed: no group selected");
+        return;
+    }
+    if app.pedals.groups[group_index].presets.is_empty() {
+        let group_name = app.pedals.groups[group_index].name.clone();
+        app.add_log(format!("pedal load skipped: {} is empty", group_name));
+        return;
+    }
+    let (group_name, preset) = {
+        let group = &mut app.pedals.groups[group_index];
+        let preset_index = preset_index.min(group.presets.len().saturating_sub(1));
+        group.current = preset_index;
+        (group.name.clone(), group.presets[preset_index].clone())
+    };
+    if let Err(err) = save_pedals_state(&app.pedals) {
+        app.add_log(format!("pedal save failed: {}", err));
+    }
+    app.add_log(format!(
+        "pedal {}: {} / {}",
+        group_name, preset.bank, preset.preset
+    ));
+    spawn_set_preset(app, preset.bank, preset.preset);
 }
 
 fn handle_audio_picker_key(app: &mut App, key: KeyEvent) -> bool {
@@ -1173,6 +1589,12 @@ fn apply_event(app: &mut App, event: AppEvent) {
                         .preset_selected
                         .min(app.guitarix.presets.len().saturating_sub(1));
                 }
+                if app.pedals.picking_preset
+                    && app.pedals.picker_bank.is_empty()
+                    && !app.guitarix.banks.is_empty()
+                {
+                    select_pedal_picker_bank(app, 0);
+                }
             }
             Err(err) => {
                 app.guitarix.loading = false;
@@ -1251,6 +1673,23 @@ fn apply_event(app: &mut App, event: AppEvent) {
                         .min(app.recordings.items.len().saturating_sub(1));
                 }
                 Err(err) => app.recordings.err = err,
+            }
+        }
+        AppEvent::PedalPickerPresets { bank, result } => {
+            if app.pedals.picker_bank != bank {
+                return;
+            }
+            app.pedals.picker_loading = false;
+            match result {
+                Ok(presets) => {
+                    app.pedals.picker_err.clear();
+                    app.pedals.picker_presets = presets;
+                    app.pedals.picker_preset_selected = app
+                        .pedals
+                        .picker_preset_selected
+                        .min(app.pedals.picker_presets.len().saturating_sub(1));
+                }
+                Err(err) => app.pedals.picker_err = err,
             }
         }
     }
@@ -1380,6 +1819,7 @@ fn render(frame: &mut Frame, app: &App) {
     match app.active_tab {
         Tab::Library => render_library(frame, app, chunks[1]),
         Tab::Audio => render_audio(frame, app, chunks[1]),
+        Tab::Pedals => render_pedals(frame, app, chunks[1]),
         Tab::Recordings => render_recordings(frame, app, chunks[1]),
         Tab::Guitarix => render_guitarix(frame, app, chunks[1]),
     }
@@ -1398,6 +1838,8 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     };
     let tabs = vec![
         tab_span(app, Tab::Audio, "Audio"),
+        Span::raw(" "),
+        tab_span(app, Tab::Pedals, "Pedals"),
         Span::raw(" "),
         tab_span(app, Tab::Library, "Library"),
         Span::raw(" "),
@@ -1420,7 +1862,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 
 fn header_status_line(app: &App, state: Span<'static>) -> Line<'static> {
     if app.active_tab != Tab::Library {
-        return Line::from("");
+        return Line::from(pedal_status_spans(app));
     }
     let query = if app.query.is_empty() {
         "all guitarix"
@@ -1453,6 +1895,40 @@ fn header_path_line(app: &App, width: u16) -> Line<'static> {
     ))
 }
 
+fn pedal_status_spans(app: &App) -> Vec<Span<'static>> {
+    if let Some(group) = app.pedals.groups.get(app.pedals.selected) {
+        let current = group.current.min(group.presets.len().saturating_sub(1));
+        if let Some(preset) = group.presets.get(current) {
+            return vec![
+                Span::styled("PEDAL", active_badge_style()),
+                Span::raw(" "),
+                Span::styled(group.name.clone(), accent_style()),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{}/{}", current + 1, group.presets.len()),
+                    badge_style(),
+                ),
+                Span::raw(" "),
+                Span::raw(format!("{} / {}", preset.bank, preset.preset)),
+                Span::raw(" "),
+                Span::styled(", prev  ; next", muted_style()),
+            ];
+        }
+        return vec![
+            Span::styled("PEDAL", active_badge_style()),
+            Span::raw(" "),
+            Span::styled(group.name.clone(), accent_style()),
+            Span::raw(" "),
+            Span::styled("empty", muted_style()),
+        ];
+    }
+    vec![
+        Span::styled("PEDAL", active_badge_style()),
+        Span::raw(" "),
+        Span::styled("none", muted_style()),
+    ]
+}
+
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![Line::from(vec![
         Span::styled(format!("queued {}", app.stats.queued), badge_style()),
@@ -1474,6 +1950,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             },
         ),
     ])];
+    lines[0].spans.push(Span::raw(" "));
+    lines[0].spans.extend(pedal_status_spans(app));
     if let Some(recording) = &app.recording {
         lines[0].spans.push(Span::raw(" "));
         lines[0].spans.push(Span::styled(
@@ -1977,6 +2455,244 @@ fn render_volume_visualizer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn render_pedals(frame: &mut Frame, app: &App, area: Rect) {
+    if app.mode == Mode::NewPedalGroup || app.mode == Mode::RenamePedalGroup {
+        let title = if app.mode == Mode::NewPedalGroup {
+            "New Pedal Group"
+        } else {
+            "Rename Pedal Group"
+        };
+        let body = vec![
+            Line::from("Enter a group name. Esc cancels."),
+            Line::from(""),
+            Line::from(Span::styled(format!(" {}_ ", app.input), selected_style())),
+        ];
+        frame.render_widget(Paragraph::new(body).block(panel_block(title, true)), area);
+        return;
+    }
+    if app.pedals.picking_preset {
+        render_pedal_picker(frame, app, area);
+        return;
+    }
+    if area.width >= 104 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(8), Constraint::Length(7)])
+            .split(area);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+            .split(rows[0]);
+        render_pedal_groups(frame, app, cols[0]);
+        render_pedal_presets(frame, app, cols[1]);
+        render_pedal_detail(frame, app, rows[1]);
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(40),
+                Constraint::Min(6),
+            ])
+            .split(area);
+        render_pedal_groups(frame, app, rows[0]);
+        render_pedal_presets(frame, app, rows[1]);
+        render_pedal_detail(frame, app, rows[2]);
+    }
+}
+
+fn render_pedal_groups(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if app.pedals.groups.is_empty() {
+        lines.push(Line::from(Span::styled("No pedal groups.", muted_style())));
+        lines.push(Line::from(Span::styled("n creates one.", muted_style())));
+    } else {
+        let max_rows = area.height.saturating_sub(2) as usize;
+        let top = if app.pedals.selected >= max_rows {
+            app.pedals.selected - max_rows + 1
+        } else {
+            0
+        };
+        for i in top..(top + max_rows).min(app.pedals.groups.len()) {
+            let group = &app.pedals.groups[i];
+            let count = if group.presets.len() == 1 {
+                "1 preset".to_string()
+            } else {
+                format!("{} presets", group.presets.len())
+            };
+            let width = area.width.saturating_sub(17).max(8) as usize;
+            let line = format!(
+                "{:2}. {:width$} {}",
+                i + 1,
+                truncate(&group.name, width),
+                count,
+                width = width
+            );
+            lines.push(Line::from(Span::styled(
+                line,
+                if i == app.pedals.selected {
+                    selected_style()
+                } else if app.pedals.focus == PedalFocus::Groups {
+                    item_style()
+                } else {
+                    muted_style()
+                },
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(panel_block(
+            "Groups",
+            app.pedals.focus == PedalFocus::Groups,
+        )),
+        area,
+    );
+}
+
+fn render_pedal_presets(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if let Some(group) = app.pedals.groups.get(app.pedals.selected) {
+        if group.presets.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No presets in this group.",
+                muted_style(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "a opens the preset picker.",
+                muted_style(),
+            )));
+        } else {
+            let selected = group.current.min(group.presets.len().saturating_sub(1));
+            let max_rows = area.height.saturating_sub(2) as usize;
+            let top = if selected >= max_rows {
+                selected - max_rows + 1
+            } else {
+                0
+            };
+            for i in top..(top + max_rows).min(group.presets.len()) {
+                let preset = &group.presets[i];
+                let mark = if i == selected { ">" } else { " " };
+                let width = area.width.saturating_sub(12).max(8) as usize;
+                let text = format!("{} {} / {}", mark, preset.bank, preset.preset);
+                lines.push(Line::from(Span::styled(
+                    format!("{:2}. {}", i + 1, truncate(&text, width)),
+                    if i == selected {
+                        selected_style()
+                    } else if app.pedals.focus == PedalFocus::Presets {
+                        item_style()
+                    } else {
+                        muted_style()
+                    },
+                )));
+            }
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Create a group first.",
+            muted_style(),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(panel_block(
+            "Group Presets",
+            app.pedals.focus == PedalFocus::Presets,
+        )),
+        area,
+    );
+}
+
+fn render_pedal_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if let Some(group) = app.pedals.groups.get(app.pedals.selected) {
+        lines.push(label_line("Group", &group.name, area.width as usize));
+        if let Some(preset) = group
+            .presets
+            .get(group.current.min(group.presets.len().saturating_sub(1)))
+        {
+            lines.push(label_line(
+                "Current",
+                &format!("{} / {}", preset.bank, preset.preset),
+                area.width as usize,
+            ));
+            lines.push(label_line(
+                "Position",
+                &format!(
+                    "{}/{}",
+                    group.current.min(group.presets.len().saturating_sub(1)) + 1,
+                    group.presets.len()
+                ),
+                area.width as usize,
+            ));
+        } else {
+            lines.push(label_line("Current", "empty", area.width as usize));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No group selected.",
+            muted_style(),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "n new  e rename  a add preset  enter/s load  , previous  ; next  x delete",
+        muted_style(),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(panel_block("Pedal Control", false)),
+        area,
+    );
+}
+
+fn render_pedal_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(3)])
+        .split(area);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(rows[0]);
+    render_string_list(
+        frame,
+        "Banks",
+        &app.guitarix.banks,
+        app.pedals.picker_bank_selected,
+        cols[0],
+        app.pedals.picker_focus == 0,
+        app.guitarix.loading && app.guitarix.banks.is_empty(),
+        &app.guitarix.err,
+    );
+    render_string_list(
+        frame,
+        "Presets",
+        &app.pedals.picker_presets,
+        app.pedals.picker_preset_selected,
+        cols[1],
+        app.pedals.picker_focus == 1,
+        app.pedals.picker_loading,
+        &app.pedals.picker_err,
+    );
+    let target = app
+        .pedals
+        .groups
+        .get(app.pedals.selected)
+        .map(|group| group.name.clone())
+        .unwrap_or_else(|| "no group".to_string());
+    let lines = vec![
+        label_line("Add to", &target, rows[1].width as usize),
+        Line::from(Span::styled(
+            "h/l focus  up/down select  enter/a add  esc cancel",
+            muted_style(),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(panel_block("Preset Picker", true)),
+        rows[1],
+    );
+}
+
 fn render_recordings(frame: &mut Frame, app: &App, area: Rect) {
     if area.width >= 96 {
         let chunks = Layout::default()
@@ -2389,6 +3105,14 @@ fn spawn_guitarix_refresh(app: &App, preferred_bank: String) {
     thread::spawn(move || {
         let result = guitarix_snapshot(&preferred_bank).map_err(|err| err.to_string());
         let _ = tx.send(AppEvent::Guitarix(result));
+    });
+}
+
+fn spawn_pedal_picker_presets(app: &App, bank: String) {
+    let tx = app.tx.clone();
+    thread::spawn(move || {
+        let result = guitarix_presets(&bank).map_err(|err| err.to_string());
+        let _ = tx.send(AppEvent::PedalPickerPresets { bank, result });
     });
 }
 
@@ -3195,6 +3919,17 @@ fn sanitize_recording_name(input: &str) -> String {
     }
 }
 
+fn sanitize_group_name(input: &str) -> String {
+    input
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(80)
+        .collect()
+}
+
 fn guitarix_snapshot(preferred_bank: &str) -> Result<GuitarixSnapshot> {
     let banks = guitarix_banks()?;
     if banks.is_empty() {
@@ -3522,6 +4257,32 @@ fn save_app_config(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+fn load_pedals_file() -> PedalsState {
+    let file = fs::read_to_string(pedals_config_path())
+        .ok()
+        .and_then(|data| serde_json::from_str::<PedalsFile>(&data).ok())
+        .unwrap_or_default();
+    let selected = file.selected.min(file.groups.len().saturating_sub(1));
+    PedalsState {
+        groups: file.groups,
+        selected,
+        ..PedalsState::default()
+    }
+}
+
+fn save_pedals_state(pedals: &PedalsState) -> Result<()> {
+    let path = pedals_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = PedalsFile {
+        groups: pedals.groups.clone(),
+        selected: pedals.selected.min(pedals.groups.len().saturating_sub(1)),
+    };
+    fs::write(path, serde_json::to_string_pretty(&file)? + "\n")?;
+    Ok(())
+}
+
 fn app_config_path() -> PathBuf {
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -3529,6 +4290,15 @@ fn app_config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("gxpreset")
         .join("config.json")
+}
+
+fn pedals_config_path() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("gxpreset")
+        .join("pedals.json")
 }
 
 fn default_bank_dir() -> PathBuf {
@@ -3703,10 +4473,11 @@ fn label_line(label: &str, value: &str, width: usize) -> Line<'static> {
 
 fn help_line(app: &App) -> String {
     match app.active_tab {
-        Tab::Audio => "tab/shift-tab view  h/left connections  l/right visualizer  up/down select  enter picker  space toggle target  R record  r refresh  q quit  ? hide".to_string(),
-        Tab::Recordings => "tab/shift-tab view  up/down select  enter/p play  s stop  e rename  x delete  r refresh  q quit  ? hide".to_string(),
-        Tab::Guitarix => "tab/shift-tab view  h banks  l presets  up/down select  enter/s switch preset  x delete bank  r refresh  q quit  ? hide".to_string(),
-        Tab::Library => "tab/shift-tab view  up/down select  enter/d download  a all visible  / search  n/p page  o order  c crawl  r refresh  q quit  ? hide".to_string(),
+        Tab::Audio => "tab/shift-tab view  ,/; pedal prev/next  h/l focus  up/down select  enter picker  R record  r refresh  q quit".to_string(),
+        Tab::Pedals => "tab/shift-tab view  ,/; pedal prev/next  h/l focus  n new  e rename  a add  enter load  x delete  q quit".to_string(),
+        Tab::Recordings => "tab/shift-tab view  ,/; pedal prev/next  up/down select  enter/p play  s stop  e rename  x delete  r refresh  q quit".to_string(),
+        Tab::Guitarix => "tab/shift-tab view  ,/; pedal prev/next  h banks  l presets  enter/s switch preset  x delete bank  r refresh  q quit".to_string(),
+        Tab::Library => "tab/shift-tab view  ,/; pedal prev/next  up/down select  enter/d download  a all visible  / search  n/p page  o order  c crawl  r refresh  q quit".to_string(),
     }
 }
 

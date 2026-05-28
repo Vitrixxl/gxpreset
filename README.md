@@ -2,7 +2,7 @@
 
 Ratatui terminal UI for a small headless Guitarix/PipeWire rig.
 
-It can browse and download Guitarix presets from Musical Artifacts, inspect PipeWire audio nodes, connect sources to targets, show a lightweight volume-history visualizer, record the selected meter source, play/rename/delete recordings, and control Guitarix banks/presets over its JSON-RPC interface.
+It can browse and download Guitarix presets from Musical Artifacts, inspect PipeWire audio nodes, connect sources to targets, show a lightweight volume-history visualizer, record the selected meter source, play/rename/delete recordings, manage pedal groups made of Guitarix presets, and control Guitarix banks/presets over its JSON-RPC interface.
 
 ## Build
 
@@ -71,10 +71,13 @@ Run JACK apps through PipeWire with `pw-jack`, for example `pw-jack guitarix -N 
 
 Main keys:
 
-- `tab`: switch view
+- `tab` / `shift-tab`: switch view
+- `,` / `;`: switch the active pedal group to the previous/next preset globally
 - `h` / `l`: move focus left/right where applicable
 - `enter`: select/open/connect
 - `space`: toggle target connection in the audio target picker
+- `n`: create a pedal group in the Pedals tab
+- `a`: add a Guitarix preset to a pedal group in the Pedals tab
 - `x`: disconnect or delete a Guitarix bank when focused
 - `R`: start/stop recording from the Audio visualizer
 - `p` / `s`: play or stop a recording in the Records tab
@@ -86,4 +89,10 @@ Recordings are saved as WAV files in:
 
 ```sh
 ${XDG_DATA_HOME:-$HOME/.local/share}/gxpreset/recordings
+```
+
+Pedal groups are saved in:
+
+```sh
+${XDG_CONFIG_HOME:-$HOME/.config}/gxpreset/pedals.json
 ```
