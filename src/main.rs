@@ -4193,14 +4193,35 @@ fn build_pedal_bank_content(group: &PedalGroup, dir: &Path) -> Result<Value> {
 }
 
 fn read_guitarix_preset_data(dir: &Path, bank: &str, preset: &str) -> Result<(Value, Value)> {
+    match read_local_guitarix_preset_data(dir, bank, preset) {
+        Ok(data) => return Ok(data),
+        Err(local_err) => {
+            let content = guitarix_bank_contents(bank).map_err(|rpc_err| {
+                anyhow::anyhow!(
+                    "local bank read failed: {}; Guitarix RPC bank_get_contents failed: {}",
+                    local_err,
+                    rpc_err
+                )
+            })?;
+            parse_guitarix_preset_data(&content, &format!("Guitarix RPC bank {:?}", bank), preset)
+                .with_context(|| format!("local bank read failed first: {}", local_err))
+        }
+    }
+}
+
+fn read_local_guitarix_preset_data(dir: &Path, bank: &str, preset: &str) -> Result<(Value, Value)> {
     let path = resolve_guitarix_bank_file(bank, dir)?;
     let data = fs::read_to_string(&path)
         .with_context(|| format!("read Guitarix bank {}", path.display()))?;
-    let value: Value = serde_json::from_str(&data)
-        .with_context(|| format!("parse Guitarix bank {}", path.display()))?;
+    parse_guitarix_preset_data(&data, &path.display().to_string(), preset)
+}
+
+fn parse_guitarix_preset_data(data: &str, origin: &str, preset: &str) -> Result<(Value, Value)> {
+    let value: Value =
+        serde_json::from_str(&data).with_context(|| format!("parse Guitarix bank {}", origin))?;
     let items = value
         .as_array()
-        .ok_or_else(|| anyhow::anyhow!("Guitarix bank is not a JSON array: {}", path.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("Guitarix bank is not a JSON array: {}", origin))?;
     let header = items
         .get(1)
         .cloned()
@@ -4216,9 +4237,9 @@ fn read_guitarix_preset_data(dir: &Path, bank: &str, preset: &str) -> Result<(Va
         }
     }
     Err(anyhow::anyhow!(
-        "preset {:?} not found in bank {:?}",
+        "preset {:?} not found in {}",
         preset,
-        bank
+        origin
     ))
 }
 
@@ -4353,6 +4374,15 @@ fn guitarix_presets(bank: &str) -> Result<Vec<String>> {
 
 fn guitarix_set_preset(bank: &str, preset: &str) -> Result<()> {
     guitarix_notify("setpreset", json!([bank, preset]))
+}
+
+fn guitarix_bank_contents(bank: &str) -> Result<String> {
+    let raw = guitarix_call("bank_get_contents", json!([bank]))?;
+    raw.as_array()
+        .and_then(|items| items.get(1))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("invalid bank_get_contents response for {:?}", bank))
 }
 
 fn guitarix_bank_check_reparse() -> Result<bool> {
@@ -4500,6 +4530,9 @@ fn resolve_guitarix_bank_file(bank: &str, dir: &Path) -> Result<PathBuf> {
             return Ok(path);
         }
     }
+    if let Ok(Some(path)) = resolve_guitarix_bank_file_from_banklist(bank, dir) {
+        return Ok(path);
+    }
     let key = normalized_key(bank);
     for entry in fs::read_dir(dir).unwrap_or_else(|_| fs::read_dir(".").unwrap()) {
         let entry = entry?;
@@ -4516,6 +4549,35 @@ fn resolve_guitarix_bank_file(bank: &str, dir: &Path) -> Result<PathBuf> {
         bank,
         dir.display()
     ))
+}
+
+fn resolve_guitarix_bank_file_from_banklist(bank: &str, dir: &Path) -> Result<Option<PathBuf>> {
+    let entries = read_guitarix_banklist(&dir.join("banklist.js"))?;
+    for entry in entries {
+        let Some(items) = entry.as_array() else {
+            continue;
+        };
+        let entry_bank = items.first().and_then(Value::as_str).unwrap_or("");
+        let entry_file = items.get(1).and_then(Value::as_str).unwrap_or("");
+        if !banklist_entry_matches(&entry, bank, "")
+            && normalized_key(entry_bank) != normalized_key(bank)
+        {
+            continue;
+        }
+        if entry_file.is_empty() {
+            continue;
+        }
+        let path = Path::new(entry_file);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            dir.join(path)
+        };
+        if path.exists() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 fn command_path(name: &str) -> Result<String> {
@@ -5101,6 +5163,29 @@ mod tests {
         let first = banklist.as_array().unwrap()[0].as_array().unwrap();
         assert_eq!(first[0].as_str(), Some("gxpreset - Live"));
         assert_eq!(first[1].as_str(), Some("gxpreset - Live.gx"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolves_source_bank_through_banklist_filename() {
+        let dir = test_dir("banklist-source");
+        fs::write(
+            dir.join("actual-source-file.gx"),
+            r#"[
+  "gx_head_file_version", [1, 2, "0.44.1"],
+  "Crunch", {"engine": {"drive": 1}}
+]"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("banklist.js"),
+            r#"[["Display Bank", "actual-source-file.gx", 1, 0, [1, 2], 1]]"#,
+        )
+        .unwrap();
+
+        let (_, preset) = read_guitarix_preset_data(&dir, "Display Bank", "Crunch").unwrap();
+        assert_eq!(preset["engine"]["drive"].as_i64(), Some(1));
 
         let _ = fs::remove_dir_all(dir);
     }
