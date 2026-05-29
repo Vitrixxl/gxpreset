@@ -45,6 +45,45 @@ const TUNER_MIN_FREQ: f64 = 55.0;
 const TUNER_MAX_FREQ: f64 = 1200.0;
 const TUNER_MIN_DB: f64 = -45.0;
 const TUNER_YIN_THRESHOLD: f64 = 0.16;
+const STANDARD_GUITAR_STRINGS: [GuitarString; 6] = [
+    GuitarString {
+        number: 6,
+        note: "E2",
+        frequency: 82.4069,
+    },
+    GuitarString {
+        number: 5,
+        note: "A2",
+        frequency: 110.0,
+    },
+    GuitarString {
+        number: 4,
+        note: "D3",
+        frequency: 146.8324,
+    },
+    GuitarString {
+        number: 3,
+        note: "G3",
+        frequency: 195.9977,
+    },
+    GuitarString {
+        number: 2,
+        note: "B3",
+        frequency: 246.9417,
+    },
+    GuitarString {
+        number: 1,
+        note: "E4",
+        frequency: 329.6276,
+    },
+];
+
+#[derive(Clone, Copy, Debug)]
+struct GuitarString {
+    number: u8,
+    note: &'static str,
+    frequency: f64,
+}
 
 #[derive(Clone, Debug, Default)]
 struct Artifact {
@@ -90,7 +129,10 @@ struct TunerState {
     source: String,
     target: String,
     note: String,
+    detected_note: String,
+    string_number: u8,
     frequency: f64,
+    target_frequency: f64,
     cents: f64,
     confidence: f64,
     level: f64,
@@ -100,7 +142,10 @@ struct TunerState {
 #[derive(Clone, Debug, Default)]
 struct TunerReading {
     note: String,
+    detected_note: String,
+    string_number: u8,
     frequency: f64,
+    target_frequency: f64,
     cents: f64,
     confidence: f64,
     level: f64,
@@ -1565,7 +1610,10 @@ impl App {
     fn close_tuner(&mut self) {
         self.tuner.open = false;
         self.tuner.note.clear();
+        self.tuner.detected_note.clear();
+        self.tuner.string_number = 0;
         self.tuner.frequency = 0.0;
+        self.tuner.target_frequency = 0.0;
         self.tuner.cents = 0.0;
         self.tuner.confidence = 0.0;
         self.tuner.level = 0.0;
@@ -1868,7 +1916,10 @@ fn apply_event(app: &mut App, event: AppEvent) {
                 app.tuner.source = app.audio.meter_source.clone();
                 app.tuner.target = app.audio.meter_target.clone();
                 app.tuner.note = reading.note;
+                app.tuner.detected_note = reading.detected_note;
+                app.tuner.string_number = reading.string_number;
                 app.tuner.frequency = reading.frequency;
+                app.tuner.target_frequency = reading.target_frequency;
                 app.tuner.cents = reading.cents;
                 app.tuner.confidence = reading.confidence;
                 app.tuner.level = reading.level;
@@ -2677,7 +2728,7 @@ fn render_volume_visualizer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_tuner_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    let dialog = centered_rect(area, 76, 13);
+    let dialog = centered_rect(area, 82, 15);
     frame.render_widget(Clear, dialog);
     frame.render_widget(panel_block("Tuner", true), dialog);
     let inner = dialog.inner(Margin {
@@ -2705,7 +2756,7 @@ fn render_tuner_dialog(frame: &mut Frame, app: &App, area: Rect) {
         )));
     } else if app.tuner.note.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("Note: ", muted_style()),
+            Span::styled("String: ", muted_style()),
             Span::styled("--", muted_style()),
             Span::raw("  "),
             Span::styled(
@@ -2715,10 +2766,24 @@ fn render_tuner_dialog(frame: &mut Frame, app: &App, area: Rect) {
         ]));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("Note: ", muted_style()),
-            Span::styled(app.tuner.note.clone(), tuner_cursor_style(app.tuner.cents)),
+            Span::styled("String: ", muted_style()),
+            Span::styled(
+                format!("{} {}", app.tuner.string_number, app.tuner.note),
+                tuner_cursor_style(app.tuner.cents),
+            ),
             Span::raw("  "),
-            Span::styled(format!("{:.1} Hz", app.tuner.frequency), item_style()),
+            Span::styled(
+                format!("target {:.1} Hz", app.tuner.target_frequency),
+                item_style(),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "heard {} {:.1} Hz",
+                    app.tuner.detected_note, app.tuner.frequency
+                ),
+                muted_style(),
+            ),
             Span::raw("  "),
             Span::styled(
                 format!("{:+.1} cents", app.tuner.cents),
@@ -2731,6 +2796,10 @@ fn render_tuner_dialog(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]));
     }
+    lines.push(tuner_strings_line(
+        app.tuner.string_number,
+        !app.tuner.note.is_empty(),
+    ));
     lines.push(Line::from(""));
     lines.push(tuner_bar_line(
         app.tuner.cents,
@@ -2763,6 +2832,24 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
+}
+
+fn tuner_strings_line(active_string: u8, active: bool) -> Line<'static> {
+    let mut spans = Vec::new();
+    spans.push(Span::styled("Strings: ", muted_style()));
+    for string in STANDARD_GUITAR_STRINGS {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        let label = format!("{} {}", string.number, string.note);
+        let style = if active && string.number == active_string {
+            tuner_cursor_style(0.0)
+        } else {
+            muted_style()
+        };
+        spans.push(Span::styled(label, style));
+    }
+    Line::from(spans)
 }
 
 fn tuner_bar_line(cents: f64, width: usize, active: bool) -> Line<'static> {
@@ -4190,10 +4277,14 @@ fn tuner_from_pcm(data: &[u8]) -> TunerReading {
             ..TunerReading::default()
         };
     };
-    let (note, cents) = note_from_frequency(frequency);
+    let (detected_note, _) = note_from_frequency(frequency);
+    let (string, cents) = nearest_guitar_string(frequency);
     TunerReading {
-        note,
+        note: string.note.to_string(),
+        detected_note,
+        string_number: string.number,
         frequency,
+        target_frequency: string.frequency,
         cents,
         confidence,
         level,
@@ -4302,6 +4393,27 @@ fn note_from_frequency(frequency: f64) -> (String, f64) {
     let index = note_index.rem_euclid(12) as usize;
     let octave = note_index.div_euclid(12) - 1;
     (format!("{}{}", names[index], octave), cents)
+}
+
+fn nearest_guitar_string(frequency: f64) -> (GuitarString, f64) {
+    let mut best = STANDARD_GUITAR_STRINGS[0];
+    let mut best_cents = cents_from_target(frequency, best.frequency);
+    for string in STANDARD_GUITAR_STRINGS.iter().copied().skip(1) {
+        let cents = cents_from_target(frequency, string.frequency);
+        if cents.abs() < best_cents.abs() {
+            best = string;
+            best_cents = cents;
+        }
+    }
+    (best, best_cents)
+}
+
+fn cents_from_target(frequency: f64, target: f64) -> f64 {
+    if frequency <= 0.0 || target <= 0.0 {
+        0.0
+    } else {
+        1200.0 * (frequency / target).log2()
+    }
 }
 
 fn smooth_volume(previous: f64, next: f64) -> f64 {
@@ -5571,16 +5683,26 @@ mod tests {
     }
 
     #[test]
-    fn tuner_detects_a4_from_pcm() {
-        let pcm = sine_pcm(440.0, METER_FRAME_SAMPLES, METER_SAMPLE_RATE);
+    fn tuner_detects_standard_a_string_from_pcm() {
+        let pcm = sine_pcm(110.0, METER_FRAME_SAMPLES, METER_SAMPLE_RATE);
         let reading = tuner_from_pcm(&pcm);
-        assert_eq!(reading.note, "A4");
+        assert_eq!(reading.string_number, 5);
+        assert_eq!(reading.note, "A2");
+        assert_eq!(reading.detected_note, "A2");
         assert!(
-            (reading.frequency - 440.0).abs() < 2.0,
+            (reading.frequency - 110.0).abs() < 1.0,
             "{}",
             reading.frequency
         );
         assert!(reading.cents.abs() < 8.0, "{}", reading.cents);
+    }
+
+    #[test]
+    fn guitar_tuner_uses_nearest_standard_string() {
+        let (string, cents) = nearest_guitar_string(329.6276);
+        assert_eq!(string.number, 1);
+        assert_eq!(string.note, "E4");
+        assert!(cents.abs() < 1.0);
     }
 
     #[test]
