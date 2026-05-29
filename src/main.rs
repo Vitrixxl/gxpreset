@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use regex::Regex;
@@ -41,6 +41,10 @@ const VOLUME_DB_GATE: f64 = -38.0;
 const VOLUME_DB_CEILING: f64 = 0.0;
 const VISUALIZER_MAX_HEIGHT_RATIO: f64 = 0.72;
 const PEDAL_BANK_PREFIX: &str = "gxpreset - ";
+const TUNER_MIN_FREQ: f64 = 55.0;
+const TUNER_MAX_FREQ: f64 = 1200.0;
+const TUNER_MIN_DB: f64 = -45.0;
+const TUNER_YIN_THRESHOLD: f64 = 0.16;
 
 #[derive(Clone, Debug, Default)]
 struct Artifact {
@@ -78,6 +82,28 @@ struct AudioState {
     meter_source: String,
     meter_target: String,
     meter_err: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TunerState {
+    open: bool,
+    source: String,
+    target: String,
+    note: String,
+    frequency: f64,
+    cents: f64,
+    confidence: f64,
+    level: f64,
+    err: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TunerReading {
+    note: String,
+    frequency: f64,
+    cents: f64,
+    confidence: f64,
+    level: f64,
 }
 
 impl Default for AudioState {
@@ -292,6 +318,7 @@ struct App {
     download_seen: Arc<Mutex<HashSet<String>>>,
     stats: DownloaderStats,
     audio: AudioState,
+    tuner: TunerState,
     pedals: PedalsState,
     recordings: RecordingsState,
     guitarix: GuitarixState,
@@ -305,6 +332,7 @@ struct MeterControl {
     id: u64,
     source: String,
     target: String,
+    tuner: bool,
     cancel: Arc<AtomicBool>,
 }
 
@@ -345,6 +373,7 @@ enum AppEvent {
         source: String,
         target: String,
         level: f64,
+        tuner: Option<TunerReading>,
         err: String,
     },
     Recordings(Result<Vec<RecordingItem>, String>),
@@ -468,6 +497,7 @@ fn run_tui(client: Client, args: Args, deps: DependencyStatus) -> Result<()> {
         download_seen: Arc::new(Mutex::new(HashSet::new())),
         stats: DownloaderStats::default(),
         audio: AudioState::default(),
+        tuner: TunerState::default(),
         pedals,
         recordings: RecordingsState {
             loading: true,
@@ -554,6 +584,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.mode == Mode::NewPedalGroup || app.mode == Mode::RenamePedalGroup {
         return handle_pedal_group_input_key(app, key);
     }
+    if app.tuner.open && matches!(key.code, KeyCode::Esc | KeyCode::Char('t')) {
+        app.close_tuner();
+        app.stop_meter();
+        return true;
+    }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.quitting = true;
@@ -611,6 +646,7 @@ fn switch_tab(app: &mut App, direction: i8) {
     };
     if app.active_tab != Tab::Audio {
         app.stop_meter();
+        app.close_tuner();
     }
 }
 
@@ -709,6 +745,7 @@ fn handle_audio_key(app: &mut App, key: KeyEvent) -> bool {
             app.audio.loading = true;
             spawn_audio_refresh(app);
         }
+        KeyCode::Char('t') => toggle_tuner(app),
         KeyCode::Char('R') => toggle_recording(app),
         KeyCode::Enter | KeyCode::Char('c') => {
             if app.audio.focus == AudioFocus::Connections {
@@ -911,6 +948,29 @@ fn handle_rename_recording_key(app: &mut App, key: KeyEvent) -> bool {
         _ => return false,
     }
     true
+}
+
+fn toggle_tuner(app: &mut App) {
+    if app.tuner.open {
+        app.close_tuner();
+        app.stop_meter();
+        return;
+    }
+    let node = app.selected_meter_source();
+    let source = node.name.clone();
+    if source.is_empty() || is_midi_name(&source) {
+        app.add_log("tuner failed: no audio source selected");
+        return;
+    }
+    let target = meter_target_for_node(&node);
+    app.audio.focus = AudioFocus::Meter;
+    app.tuner = TunerState {
+        open: true,
+        source,
+        target,
+        ..TunerState::default()
+    };
+    app.stop_meter();
 }
 
 fn toggle_recording(app: &mut App) {
@@ -1502,6 +1562,16 @@ impl App {
         self.meter = None;
     }
 
+    fn close_tuner(&mut self) {
+        self.tuner.open = false;
+        self.tuner.note.clear();
+        self.tuner.frequency = 0.0;
+        self.tuner.cents = 0.0;
+        self.tuner.confidence = 0.0;
+        self.tuner.level = 0.0;
+        self.tuner.err.clear();
+    }
+
     fn stop_recording(&mut self) {
         if let Some(mut recording) = self.recording.take() {
             interrupt_child(&mut recording.child);
@@ -1771,13 +1841,17 @@ fn apply_event(app: &mut App, event: AppEvent) {
             source,
             target,
             level,
+            tuner,
             err,
         } => {
             if app.meter.as_ref().is_none_or(|meter| meter.id != id) {
                 return;
             }
             if !err.is_empty() {
-                app.audio.meter_err = err;
+                app.audio.meter_err = err.clone();
+                if app.tuner.open {
+                    app.tuner.err = err;
+                }
                 app.stop_meter();
                 return;
             }
@@ -1789,6 +1863,16 @@ fn apply_event(app: &mut App, event: AppEvent) {
             app.audio.volume_history.insert(0, shown);
             if app.audio.volume_history.len() > MAX_VOLUME_HISTORY {
                 app.audio.volume_history.truncate(MAX_VOLUME_HISTORY);
+            }
+            if let Some(reading) = tuner {
+                app.tuner.source = app.audio.meter_source.clone();
+                app.tuner.target = app.audio.meter_target.clone();
+                app.tuner.note = reading.note;
+                app.tuner.frequency = reading.frequency;
+                app.tuner.cents = reading.cents;
+                app.tuner.confidence = reading.confidence;
+                app.tuner.level = reading.level;
+                app.tuner.err.clear();
             }
         }
         AppEvent::Recordings(result) => {
@@ -1954,6 +2038,9 @@ fn render(frame: &mut Frame, app: &App) {
         Tab::Guitarix => render_guitarix(frame, app, chunks[1]),
     }
     render_footer(frame, app, chunks[2]);
+    if app.tuner.open {
+        render_tuner_dialog(frame, app, area);
+    }
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -2553,11 +2640,13 @@ fn render_volume_visualizer(frame: &mut Frame, app: &App, area: Rect) {
                             .file_name()
                             .and_then(|s| s.to_str())
                             .unwrap_or("recording.wav"),
-                        area.width.saturating_sub(16) as usize
+                        area.width.saturating_sub(28) as usize
                     )
                 ),
                 error_style(),
             ),
+            Span::raw("  "),
+            Span::styled("t tuner", accent_style()),
         ]));
     } else {
         lines.push(Line::from(vec![
@@ -2565,6 +2654,8 @@ fn render_volume_visualizer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("off", muted_style()),
             Span::raw("  "),
             Span::styled("R start", accent_style()),
+            Span::raw("  "),
+            Span::styled("t tuner", accent_style()),
         ]));
     }
     if !app.audio.meter_err.is_empty() {
@@ -2583,6 +2674,138 @@ fn render_volume_visualizer(frame: &mut Frame, app: &App, area: Rect) {
         wave_h,
     ));
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_tuner_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let dialog = centered_rect(area, 76, 13);
+    frame.render_widget(Clear, dialog);
+    frame.render_widget(panel_block("Tuner", true), dialog);
+    let inner = dialog.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+
+    let mut lines = Vec::new();
+    lines.push(label_line(
+        "Source",
+        &app.tuner.source,
+        inner.width as usize,
+    ));
+    if !app.tuner.target.is_empty() && app.tuner.target != app.tuner.source {
+        lines.push(label_line(
+            "Capture",
+            &app.tuner.target,
+            inner.width as usize,
+        ));
+    }
+    if !app.tuner.err.is_empty() {
+        lines.push(Line::from(Span::styled(
+            truncate(&app.tuner.err, inner.width as usize),
+            error_style(),
+        )));
+    } else if app.tuner.note.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Note: ", muted_style()),
+            Span::styled("--", muted_style()),
+            Span::raw("  "),
+            Span::styled(
+                format!("level {:>3}%", (app.tuner.level * 100.0).round() as u8),
+                muted_style(),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("Note: ", muted_style()),
+            Span::styled(app.tuner.note.clone(), tuner_cursor_style(app.tuner.cents)),
+            Span::raw("  "),
+            Span::styled(format!("{:.1} Hz", app.tuner.frequency), item_style()),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:+.1} cents", app.tuner.cents),
+                tuner_cursor_style(app.tuner.cents),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:.0}% conf", app.tuner.confidence * 100.0),
+                muted_style(),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(tuner_bar_line(
+        app.tuner.cents,
+        inner.width.saturating_sub(2) as usize,
+        !app.tuner.note.is_empty(),
+    ));
+    lines.push(Line::from(vec![
+        Span::styled("-50", muted_style()),
+        Span::raw(" "),
+        Span::styled("flat", muted_style()),
+        Span::raw("      "),
+        Span::styled("center", success_style()),
+        Span::raw("      "),
+        Span::styled("sharp", muted_style()),
+        Span::raw(" "),
+        Span::styled("+50", muted_style()),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("t / esc close", muted_style())));
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width).max(20);
+    let height = height.min(area.height).max(8);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn tuner_bar_line(cents: f64, width: usize, active: bool) -> Line<'static> {
+    let width = width.max(15);
+    let center = width / 2;
+    let half = center.max(1) as f64;
+    let cursor = if active {
+        (center as f64 + (cents.clamp(-50.0, 50.0) / 50.0) * half)
+            .round()
+            .clamp(0.0, (width - 1) as f64) as usize
+    } else {
+        center
+    };
+    let mut spans = Vec::with_capacity(width);
+    for i in 0..width {
+        let (ch, style) = if i == cursor {
+            (
+                "●",
+                if active {
+                    tuner_cursor_style(cents)
+                } else {
+                    muted_style()
+                },
+            )
+        } else if i == center {
+            ("│", success_style())
+        } else {
+            ("─", border_style())
+        };
+        spans.push(Span::styled(ch, style));
+    }
+    Line::from(spans)
+}
+
+fn tuner_cursor_style(cents: f64) -> Style {
+    let distance = cents.abs();
+    if distance <= 5.0 {
+        success_style().add_modifier(Modifier::BOLD)
+    } else if distance <= 15.0 {
+        active_badge_style()
+    } else {
+        error_style()
+    }
 }
 
 fn render_pedals(frame: &mut Frame, app: &App, area: Rect) {
@@ -3358,6 +3581,7 @@ fn ensure_meter_stream(app: &mut App) -> bool {
         return true;
     }
     let target = meter_target_for_node(&node);
+    let tuner_enabled = app.tuner.open;
     if app.config.last_meter_source != source {
         app.config.last_meter_source = source.clone();
         let _ = save_app_config(&app.config);
@@ -3365,7 +3589,7 @@ fn ensure_meter_stream(app: &mut App) -> bool {
     if app
         .meter
         .as_ref()
-        .is_some_and(|m| m.source == source && m.target == target)
+        .is_some_and(|m| m.source == source && m.target == target && m.tuner == tuner_enabled)
     {
         return false;
     }
@@ -3377,6 +3601,7 @@ fn ensure_meter_stream(app: &mut App) -> bool {
         id,
         source: source.clone(),
         target: target.clone(),
+        tuner: tuner_enabled,
         cancel: cancel.clone(),
     });
     app.audio.meter_source = source.clone();
@@ -3384,8 +3609,13 @@ fn ensure_meter_stream(app: &mut App) -> bool {
     app.audio.meter_err.clear();
     app.audio.volume_level = 0.0;
     app.audio.volume_history.clear();
+    if tuner_enabled {
+        app.tuner.source = source.clone();
+        app.tuner.target = target.clone();
+        app.tuner.err.clear();
+    }
     let tx = app.tx.clone();
-    thread::spawn(move || run_meter_stream(id, source, target, cancel, tx));
+    thread::spawn(move || run_meter_stream(id, source, target, tuner_enabled, cancel, tx));
     true
 }
 
@@ -3728,6 +3958,7 @@ fn run_meter_stream(
     id: u64,
     source: String,
     target: String,
+    tuner_enabled: bool,
     cancel: Arc<AtomicBool>,
     tx: Sender<AppEvent>,
 ) {
@@ -3739,6 +3970,7 @@ fn run_meter_stream(
                 source,
                 target,
                 level: 0.0,
+                tuner: None,
                 err: err.to_string(),
             });
             return;
@@ -3746,7 +3978,16 @@ fn run_meter_stream(
     };
     let mut last_err = String::new();
     for args in meter_command_specs(&target) {
-        match run_meter_command(&path, &args, id, &source, &target, &cancel, &tx) {
+        match run_meter_command(
+            &path,
+            &args,
+            id,
+            &source,
+            &target,
+            tuner_enabled,
+            &cancel,
+            &tx,
+        ) {
             Ok(()) => return,
             Err((frames, err)) => {
                 last_err = err;
@@ -3765,6 +4006,7 @@ fn run_meter_stream(
             source,
             target,
             level: 0.0,
+            tuner: None,
             err: last_err,
         });
     }
@@ -3801,6 +4043,7 @@ fn run_meter_command(
     id: u64,
     source: &str,
     target: &str,
+    tuner_enabled: bool,
     cancel: &Arc<AtomicBool>,
     tx: &Sender<AppEvent>,
 ) -> std::result::Result<(), (usize, String)> {
@@ -3835,11 +4078,13 @@ fn run_meter_command(
                 match volume_from_pcm(data) {
                     Ok(level) => {
                         frames += 1;
+                        let tuner = tuner_enabled.then(|| tuner_from_pcm(data));
                         let _ = tx.send(AppEvent::Meter {
                             id,
                             source: source.to_string(),
                             target: target.to_string(),
                             level,
+                            tuner,
                             err: String::new(),
                         });
                     }
@@ -3849,6 +4094,7 @@ fn run_meter_command(
                             source: source.to_string(),
                             target: target.to_string(),
                             level: 0.0,
+                            tuner: None,
                             err: err.to_string(),
                         });
                     }
@@ -3922,6 +4168,140 @@ fn volume_from_pcm(data: &[u8]) -> Result<f64> {
     let span = VOLUME_DB_CEILING - VOLUME_DB_GATE;
     let linear = ((db - VOLUME_DB_GATE) / span).clamp(0.0, 1.0);
     Ok(linear.powf(1.45))
+}
+
+fn tuner_from_pcm(data: &[u8]) -> TunerReading {
+    let samples = pcm_samples_centered(data);
+    if samples.len() < 512 {
+        return TunerReading::default();
+    }
+    let rms = (samples.iter().map(|v| v * v).sum::<f64>() / samples.len() as f64).sqrt();
+    let db = 20.0 * (rms + 1e-7).log10();
+    let level = ((db - TUNER_MIN_DB) / (VOLUME_DB_CEILING - TUNER_MIN_DB)).clamp(0.0, 1.0);
+    if db < TUNER_MIN_DB {
+        return TunerReading {
+            level,
+            ..TunerReading::default()
+        };
+    }
+    let Some((frequency, confidence)) = detect_pitch_yin(&samples, METER_SAMPLE_RATE as f64) else {
+        return TunerReading {
+            level,
+            ..TunerReading::default()
+        };
+    };
+    let (note, cents) = note_from_frequency(frequency);
+    TunerReading {
+        note,
+        frequency,
+        cents,
+        confidence,
+        level,
+    }
+}
+
+fn pcm_samples_centered(data: &[u8]) -> Vec<f64> {
+    let mut samples = data
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as f64 / 32768.0)
+        .collect::<Vec<_>>();
+    if samples.is_empty() {
+        return samples;
+    }
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    for sample in &mut samples {
+        *sample -= mean;
+    }
+    samples
+}
+
+fn detect_pitch_yin(samples: &[f64], sample_rate: f64) -> Option<(f64, f64)> {
+    let min_tau = (sample_rate / TUNER_MAX_FREQ).floor().max(2.0) as usize;
+    let max_tau = (sample_rate / TUNER_MIN_FREQ).ceil() as usize;
+    if samples.len() <= max_tau + 2 {
+        return None;
+    }
+
+    let mut diff = vec![0.0; max_tau + 1];
+    for tau in 1..=max_tau {
+        let limit = samples.len() - tau;
+        let mut sum = 0.0;
+        for i in 0..limit {
+            let delta = samples[i] - samples[i + tau];
+            sum += delta * delta;
+        }
+        diff[tau] = sum;
+    }
+
+    let mut cmnd = vec![1.0; max_tau + 1];
+    let mut running = 0.0;
+    let mut best_tau = 0;
+    let mut best_value = f64::MAX;
+    for tau in 1..=max_tau {
+        running += diff[tau];
+        if running > 0.0 {
+            cmnd[tau] = diff[tau] * tau as f64 / running;
+        }
+        if tau >= min_tau && cmnd[tau] < best_value {
+            best_tau = tau;
+            best_value = cmnd[tau];
+        }
+    }
+
+    let mut tau = 0;
+    for candidate in min_tau..=max_tau {
+        if cmnd[candidate] < TUNER_YIN_THRESHOLD {
+            tau = candidate;
+            while tau + 1 <= max_tau && cmnd[tau + 1] < cmnd[tau] {
+                tau += 1;
+            }
+            break;
+        }
+    }
+    if tau == 0 {
+        if best_value > 0.35 {
+            return None;
+        }
+        tau = best_tau;
+    }
+
+    let tau_f = parabolic_tau(&cmnd, tau).max(1.0);
+    let frequency = sample_rate / tau_f;
+    if !(TUNER_MIN_FREQ..=TUNER_MAX_FREQ).contains(&frequency) {
+        return None;
+    }
+    Some((frequency, (1.0 - cmnd[tau]).clamp(0.0, 1.0)))
+}
+
+fn parabolic_tau(values: &[f64], tau: usize) -> f64 {
+    if tau == 0 || tau + 1 >= values.len() {
+        return tau as f64;
+    }
+    let left = values[tau - 1];
+    let center = values[tau];
+    let right = values[tau + 1];
+    let denom = left - 2.0 * center + right;
+    if denom.abs() < 1e-9 {
+        tau as f64
+    } else {
+        tau as f64 + 0.5 * (left - right) / denom
+    }
+}
+
+fn note_from_frequency(frequency: f64) -> (String, f64) {
+    if frequency <= 0.0 {
+        return (String::new(), 0.0);
+    }
+    let midi = 69.0 + 12.0 * (frequency / 440.0).log2();
+    let nearest = midi.round();
+    let cents = (midi - nearest) * 100.0;
+    let note_index = nearest as i32;
+    let names = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let index = note_index.rem_euclid(12) as usize;
+    let octave = note_index.div_euclid(12) - 1;
+    (format!("{}{}", names[index], octave), cents)
 }
 
 fn smooth_volume(previous: f64, next: f64) -> f64 {
@@ -4930,7 +5310,7 @@ fn label_line(label: &str, value: &str, width: usize) -> Line<'static> {
 
 fn help_line(app: &App) -> String {
     match app.active_tab {
-        Tab::Audio => "tab/shift-tab view  ,/; pedal prev/next  h/l focus  up/down select  enter picker  R record  r refresh  q quit".to_string(),
+        Tab::Audio => "tab/shift-tab view  ,/; pedal prev/next  h/l focus  up/down select  enter picker  t tuner  R record  r refresh  q quit".to_string(),
         Tab::Pedals => "tab/shift-tab view  ,/; pedal prev/next  h/l focus  n new  e rename  a add  enter load  x delete  q quit".to_string(),
         Tab::Recordings => "tab/shift-tab view  ,/; pedal prev/next  up/down select  enter/p play  s stop  e rename  x delete  r refresh  q quit".to_string(),
         Tab::Guitarix => "tab/shift-tab view  ,/; pedal prev/next  h banks  l presets  enter/s switch preset  x delete bank  r refresh  q quit".to_string(),
@@ -5188,5 +5568,36 @@ mod tests {
         assert_eq!(preset["engine"]["drive"].as_i64(), Some(1));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tuner_detects_a4_from_pcm() {
+        let pcm = sine_pcm(440.0, METER_FRAME_SAMPLES, METER_SAMPLE_RATE);
+        let reading = tuner_from_pcm(&pcm);
+        assert_eq!(reading.note, "A4");
+        assert!(
+            (reading.frequency - 440.0).abs() < 2.0,
+            "{}",
+            reading.frequency
+        );
+        assert!(reading.cents.abs() < 8.0, "{}", reading.cents);
+    }
+
+    #[test]
+    fn note_names_are_english() {
+        let (note, cents) = note_from_frequency(82.4069);
+        assert_eq!(note, "E2");
+        assert!(cents.abs() < 1.0);
+    }
+
+    fn sine_pcm(freq: f64, frames: usize, sample_rate: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let t = i as f64 / sample_rate as f64;
+            let sample =
+                (0.55 * (2.0 * std::f64::consts::PI * freq * t).sin() * i16::MAX as f64) as i16;
+            out.extend_from_slice(&sample.to_le_bytes());
+        }
+        out
     }
 }

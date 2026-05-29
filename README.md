@@ -80,6 +80,7 @@ Main keys:
 - `a`: add a Guitarix preset to a pedal group in the Pedals tab
 - `x`: disconnect or delete a Guitarix bank when focused
 - `R`: start/stop recording from the Audio visualizer
+- `t`: open/close the tuner from the Audio visualizer
 - `p` / `s`: play or stop a recording in the Records tab
 - `e`: rename a recording in the Records tab
 - `r`: refresh
